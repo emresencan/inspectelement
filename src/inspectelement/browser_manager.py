@@ -10,7 +10,11 @@ from .injector import disable_overlay, ensure_injected
 from .learning_store import LearningStore
 from .locator_generator import generate_locator_candidates
 from .models import ElementSummary, LocatorCandidate, PageContext
-from .runtime_checks import _is_missing_browser_error
+from .runtime_checks import (
+    _is_missing_browser_error,
+    build_id_selector_candidates,
+    payload_matches_observed_element,
+)
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, BrowserContext, Page, Playwright
@@ -184,17 +188,47 @@ class BrowserManager:
         if not capture_id:
             return
 
-        selector = f'[data-inspectelement-capture="{capture_id}"]'
-        element = self._page.query_selector(selector)
+        element = None
+        capture_selector = f'[data-inspectelement-capture="{capture_id}"]'
+        element = self._page.query_selector(capture_selector)
+
+        if not element:
+            payload_id = payload.get("id")
+            for id_selector in build_id_selector_candidates(payload_id):
+                try:
+                    element = self._page.query_selector(id_selector)
+                except Exception:
+                    element = None
+                if element:
+                    break
+
         if not element:
             path = payload.get("path")
             if isinstance(path, str) and path:
-                element = self._page.query_selector(path)
+                try:
+                    element = self._page.query_selector(path)
+                except Exception:
+                    element = None
         if not element:
             self._on_status("Captured element no longer available.")
             return
 
         summary = extract_element_summary(element)
+        observed = {
+            "tag": summary.tag,
+            "text": summary.text,
+            "aria_label": summary.aria_label,
+            "placeholder": summary.placeholder,
+            "name": summary.name,
+        }
+        if not payload_matches_observed_element(payload, observed):
+            self._on_status("Captured element could not be re-identified (DOM changed).")
+            try:
+                element.evaluate("(el) => el.removeAttribute('data-inspectelement-capture')")
+            except Exception:
+                pass
+            return
+
         weights = self.learning_store.get_rule_weights()
         candidates = generate_locator_candidates(self._page, element, summary, learning_weights=weights, limit=5)
 

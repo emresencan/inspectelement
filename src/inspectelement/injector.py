@@ -113,6 +113,14 @@ INJECT_SCRIPT = r"""
         captureId,
         tag: el.tagName.toLowerCase(),
         text: (el.innerText || '').trim().slice(0, 200),
+        id: el.id || null,
+        classList: Array.from(el.classList || []),
+        name: el.getAttribute('name') || null,
+        role: el.getAttribute('role') || null,
+        ariaLabel: el.getAttribute('aria-label') || null,
+        placeholder: el.getAttribute('placeholder') || null,
+        inputType: el.getAttribute('type') || null,
+        href: el.getAttribute('href') || null,
         path: buildPath(el),
       };
 
