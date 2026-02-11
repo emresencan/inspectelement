@@ -20,6 +20,8 @@ _DYNAMIC_CLASS_PATTERNS = [
 
 STABLE_ATTRS = ("data-testid", "data-test", "data-qa", "aria-label", "name", "id")
 PROMOTABLE_STABLE_ATTRS = ("data-testid", "id", "name", "aria-label")
+ROOT_ID_BLOCKLIST = {"__next", "root", "app", "__nuxt", "gatsby-focus-wrapper"}
+_ROOT_ID_BLOCKLIST_LOWER = {item.lower() for item in ROOT_ID_BLOCKLIST}
 _DYNAMIC_ID_TOKEN_PATTERNS = (
     re.compile(r"^jdt_\d+$", re.IGNORECASE),
     re.compile(r"^j_idt\d+$", re.IGNORECASE),
@@ -255,7 +257,20 @@ def _stable_attr_css(tag: str, attr: str, value: str) -> str:
     return f'{tag}[{attr}="{_escape_css_string(value)}"]'
 
 
+def _is_blocked_id(tag: str, value: str) -> bool:
+    normalized_tag = tag.strip().lower()
+    normalized_id = value.strip().lower()
+    if normalized_tag in {"html", "body"}:
+        return True
+    if normalized_id in _ROOT_ID_BLOCKLIST_LOWER:
+        return True
+    return False
+
+
 def _build_stable_attr_drafts(tag: str, attr: str, value: str) -> list[CandidateDraft]:
+    if attr == "id" and _is_blocked_id(tag, value):
+        return []
+
     css = _stable_attr_css(tag, attr, value)
     drafts = [
         CandidateDraft(locator_type="CSS", locator=css, rule=f"stable_attr:{attr}"),
@@ -301,7 +316,10 @@ def _find_clickable_ancestor_snapshot(element: ElementHandle) -> dict[str, Any] 
           while (current && current.nodeType === Node.ELEMENT_NODE) {
             const tag = current.tagName.toLowerCase();
             const role = (current.getAttribute('role') || '').toLowerCase();
-            const clickable = tag === 'a' || tag === 'button' || role === 'button' || role === 'link';
+            const inputType = (current.getAttribute('type') || '').toLowerCase();
+            const clickableInput = tag === 'input' && ['button', 'submit', 'reset'].includes(inputType);
+            const clickableRole = ['button', 'tab', 'link'].includes(role);
+            const clickable = tag === 'a' || tag === 'button' || clickableInput || clickableRole;
             if (clickable) {
               const found = {};
               for (const attr of attrs) {
@@ -310,7 +328,7 @@ def _find_clickable_ancestor_snapshot(element: ElementHandle) -> dict[str, Any] 
                   found[attr] = value;
                 }
               }
-              return { tag, role, attrs: found };
+              return { tag, role, inputType, attrs: found };
             }
             current = current.parentElement;
           }
@@ -320,9 +338,22 @@ def _find_clickable_ancestor_snapshot(element: ElementHandle) -> dict[str, Any] 
     )
 
 
+def _is_clickable_ancestor_snapshot(snapshot: dict[str, Any]) -> bool:
+    tag = str(snapshot.get("tag") or "").strip().lower()
+    role = str(snapshot.get("role") or "").strip().lower()
+    input_type = str(snapshot.get("inputType") or "").strip().lower()
+    if tag in {"a", "button"}:
+        return True
+    if tag == "input" and input_type in {"button", "submit", "reset"}:
+        return True
+    return role in {"button", "tab", "link"}
+
+
 def _build_promoted_clickable_ancestor_drafts(page: Page, element: ElementHandle) -> list[CandidateDraft] | None:
     snapshot = _find_clickable_ancestor_snapshot(element)
     if not snapshot:
+        return None
+    if not _is_clickable_ancestor_snapshot(snapshot):
         return None
 
     tag = str(snapshot.get("tag") or "").strip().lower()
