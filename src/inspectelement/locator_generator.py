@@ -19,6 +19,7 @@ _DYNAMIC_CLASS_PATTERNS = [
 ]
 
 STABLE_ATTRS = ("data-testid", "data-test", "data-qa", "aria-label", "name", "id")
+PROMOTABLE_STABLE_ATTRS = ("data-testid", "id", "name", "aria-label")
 _DYNAMIC_ID_TOKEN_PATTERNS = (
     re.compile(r"^jdt_\d+$", re.IGNORECASE),
     re.compile(r"^j_idt\d+$", re.IGNORECASE),
@@ -254,6 +255,185 @@ def _stable_attr_css(tag: str, attr: str, value: str) -> str:
     return f'{tag}[{attr}="{_escape_css_string(value)}"]'
 
 
+def _build_stable_attr_drafts(tag: str, attr: str, value: str) -> list[CandidateDraft]:
+    css = _stable_attr_css(tag, attr, value)
+    drafts = [
+        CandidateDraft(locator_type="CSS", locator=css, rule=f"stable_attr:{attr}"),
+        CandidateDraft(
+            locator_type="XPath",
+            locator=f"//*[@{attr}={_xpath_literal(value)}]",
+            rule=f"stable_attr:{attr}",
+        ),
+        CandidateDraft(
+            locator_type="Selenium",
+            locator=f'By.CSS_SELECTOR("{css}")',
+            rule=f"stable_attr:{attr}",
+            metadata={"selector_kind": "css", "selector_value": css},
+        ),
+    ]
+    if attr == "data-testid":
+        drafts.append(
+            CandidateDraft(
+                locator_type="Playwright",
+                locator=f'page.get_by_test_id("{value}")',
+                rule="stable_attr:data-testid",
+                metadata={"playwright_kind": "test_id", "value": value},
+            )
+        )
+    if attr == "aria-label":
+        drafts.append(
+            CandidateDraft(
+                locator_type="Playwright",
+                locator=f'page.get_by_label("{value}", exact=True)',
+                rule="stable_attr:aria-label",
+                metadata={"playwright_kind": "label", "value": value},
+            )
+        )
+    return drafts
+
+
+def _find_clickable_ancestor_snapshot(element: ElementHandle) -> dict[str, Any] | None:
+    return element.evaluate(
+        """
+        (el) => {
+          const attrs = ['data-testid', 'id', 'name', 'aria-label'];
+          let current = el;
+          while (current && current.nodeType === Node.ELEMENT_NODE) {
+            const tag = current.tagName.toLowerCase();
+            const role = (current.getAttribute('role') || '').toLowerCase();
+            const clickable = tag === 'a' || tag === 'button' || role === 'button' || role === 'link';
+            if (clickable) {
+              const found = {};
+              for (const attr of attrs) {
+                const value = current.getAttribute(attr);
+                if (value) {
+                  found[attr] = value;
+                }
+              }
+              return { tag, role, attrs: found };
+            }
+            current = current.parentElement;
+          }
+          return null;
+        }
+        """
+    )
+
+
+def _build_promoted_clickable_ancestor_drafts(page: Page, element: ElementHandle) -> list[CandidateDraft] | None:
+    snapshot = _find_clickable_ancestor_snapshot(element)
+    if not snapshot:
+        return None
+
+    tag = str(snapshot.get("tag") or "").strip().lower()
+    attrs = snapshot.get("attrs") or {}
+    if not tag or not isinstance(attrs, dict):
+        return None
+
+    for attr in PROMOTABLE_STABLE_ATTRS:
+        value = attrs.get(attr)
+        if not value or not isinstance(value, str):
+            continue
+        if attr == "id" and is_dynamic_id(value):
+            continue
+
+        css = _stable_attr_css(tag, attr, value)
+        try:
+            if len(page.query_selector_all(css)) != 1:
+                continue
+        except Exception:
+            continue
+        return _build_stable_attr_drafts(tag, attr, value)
+    return None
+
+
+def extract_css_parent_if_descendant(locator: str) -> str | None:
+    in_quote: str | None = None
+    bracket_depth = 0
+    paren_depth = 0
+    split_index = -1
+
+    for index, char in enumerate(locator):
+        if in_quote:
+            if char == in_quote and locator[index - 1] != "\\":
+                in_quote = None
+            continue
+        if char in {"'", '"'}:
+            in_quote = char
+            continue
+        if char == "[":
+            bracket_depth += 1
+            continue
+        if char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            continue
+        if char == "(":
+            paren_depth += 1
+            continue
+        if char == ")":
+            paren_depth = max(0, paren_depth - 1)
+            continue
+        if bracket_depth > 0 or paren_depth > 0 or not char.isspace():
+            continue
+
+        left = index - 1
+        while left >= 0 and locator[left].isspace():
+            left -= 1
+        right = index + 1
+        while right < len(locator) and locator[right].isspace():
+            right += 1
+        if left < 0 or right >= len(locator):
+            continue
+        if locator[left] in {">", "+", "~", ","} or locator[right] in {">", "+", "~", ","}:
+            continue
+        split_index = index
+
+    if split_index < 0:
+        return None
+    parent = locator[:split_index].rstrip()
+    child = locator[split_index:].strip()
+    if not parent or not child:
+        return None
+    return parent
+
+
+def _prune_descendant_css_locator(page: Page, locator: str) -> str:
+    parent = extract_css_parent_if_descendant(locator)
+    if not parent:
+        return locator
+    try:
+        if len(page.query_selector_all(parent)) == 1:
+            return parent
+    except Exception:
+        return locator
+    return locator
+
+
+def _prune_descendant_css_drafts(page: Page, drafts: Iterable[CandidateDraft]) -> list[CandidateDraft]:
+    pruned: list[CandidateDraft] = []
+    seen: set[tuple[str, str]] = set()
+    for draft in drafts:
+        updated = draft
+        if draft.locator_type == "CSS":
+            locator = _prune_descendant_css_locator(page, draft.locator)
+            if locator != draft.locator:
+                metadata = dict(draft.metadata)
+                metadata["descendant_pruned"] = True
+                updated = CandidateDraft(
+                    locator_type=draft.locator_type,
+                    locator=locator,
+                    rule=draft.rule,
+                    metadata=metadata,
+                )
+
+        key = (updated.locator_type, updated.locator)
+        if key in seen:
+            continue
+        seen.add(key)
+        pruned.append(updated)
+    return pruned
+
+
 def _build_candidate_drafts(element: ElementHandle, summary: ElementSummary) -> list[CandidateDraft]:
     drafts: list[CandidateDraft] = []
     seen: set[tuple[str, str]] = set()
@@ -288,54 +468,8 @@ def _build_candidate_drafts(element: ElementHandle, summary: ElementSummary) -> 
                 )
             continue
 
-        css = _stable_attr_css(tag, attr, value)
-        _add_unique(
-            drafts,
-            CandidateDraft(locator_type="CSS", locator=css, rule=f"stable_attr:{attr}"),
-            seen,
-        )
-        _add_unique(
-            drafts,
-            CandidateDraft(
-                locator_type="XPath",
-                locator=f"//*[@{attr}={_xpath_literal(value)}]",
-                rule=f"stable_attr:{attr}",
-            ),
-            seen,
-        )
-        _add_unique(
-            drafts,
-            CandidateDraft(
-                locator_type="Selenium",
-                locator=f'By.CSS_SELECTOR("{css}")',
-                rule=f"stable_attr:{attr}",
-                metadata={"selector_kind": "css", "selector_value": css},
-            ),
-            seen,
-        )
-
-        if attr == "data-testid":
-            _add_unique(
-                drafts,
-                CandidateDraft(
-                    locator_type="Playwright",
-                    locator=f'page.get_by_test_id("{value}")',
-                    rule="stable_attr:data-testid",
-                    metadata={"playwright_kind": "test_id", "value": value},
-                ),
-                seen,
-            )
-        if attr == "aria-label":
-            _add_unique(
-                drafts,
-                CandidateDraft(
-                    locator_type="Playwright",
-                    locator=f'page.get_by_label("{value}", exact=True)',
-                    rule="stable_attr:aria-label",
-                    metadata={"playwright_kind": "label", "value": value},
-                ),
-                seen,
-            )
+        for draft in _build_stable_attr_drafts(tag, attr, value):
+            _add_unique(drafts, draft, seen)
 
     meaningful_classes = [name for name in summary.classes if not is_dynamic_class(name)]
     dynamic_count = len(summary.classes) - len(meaningful_classes)
@@ -480,7 +614,12 @@ def generate_locator_candidates(
     learning_weights: dict[str, float] | None = None,
     limit: int = 5,
 ) -> list[LocatorCandidate]:
-    drafts = _build_candidate_drafts(element, summary)
+    promoted = _build_promoted_clickable_ancestor_drafts(page, element)
+    if promoted:
+        drafts = promoted
+    else:
+        drafts = _build_candidate_drafts(element, summary)
+    drafts = _prune_descendant_css_drafts(page, drafts)
     candidates = _validate_drafts(page, drafts)
     scored = score_candidates(candidates, learning_weights)
     return scored[:limit]
