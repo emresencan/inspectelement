@@ -19,6 +19,11 @@ _DYNAMIC_CLASS_PATTERNS = [
 ]
 
 STABLE_ATTRS = ("data-testid", "data-test", "data-qa", "aria-label", "name", "id")
+_DYNAMIC_ID_TOKEN_PATTERNS = (
+    re.compile(r"^jdt_\d+$", re.IGNORECASE),
+    re.compile(r"^j_idt\d+$", re.IGNORECASE),
+    re.compile(r"^\d+$"),
+)
 
 
 @dataclass(slots=True)
@@ -60,6 +65,62 @@ def is_dynamic_class(class_name: str) -> bool:
     if value.count("-") >= 3 and re.search(r"\d", value):
         return True
     return False
+
+
+def is_dynamic_id(id_value: str) -> bool:
+    value = id_value.strip()
+    if not value or ":" not in value:
+        return False
+    if re.search(r":\d+:", value):
+        return True
+
+    tokens = [token for token in value.split(":") if token]
+    for token in tokens:
+        if any(pattern.fullmatch(token) for pattern in _DYNAMIC_ID_TOKEN_PATTERNS):
+            return True
+    return False
+
+
+def extract_dynamic_id_prefix_suffix(id_value: str) -> tuple[str, str] | None:
+    value = id_value.strip()
+    if not is_dynamic_id(value):
+        return None
+
+    tokens = value.split(":")
+    dynamic_indexes = [
+        index
+        for index, token in enumerate(tokens)
+        if any(pattern.fullmatch(token) for pattern in _DYNAMIC_ID_TOKEN_PATTERNS)
+    ]
+    if not dynamic_indexes:
+        return None
+
+    last_dynamic_index = dynamic_indexes[-1]
+    if last_dynamic_index <= 0:
+        return None
+
+    prefix = ":".join(tokens[:last_dynamic_index]) + ":"
+    if not tokens[-1]:
+        return None
+    suffix = f":{tokens[-1]}"
+    return prefix, suffix
+
+
+def build_dynamic_id_partial_locators(id_value: str) -> tuple[str, str] | None:
+    parts = extract_dynamic_id_prefix_suffix(id_value)
+    if not parts:
+        return None
+
+    prefix, suffix = parts
+    css = f'[id^="{_escape_css_string(prefix)}"][id$="{_escape_css_string(suffix)}"]'
+    xpath = (
+        "//*["
+        f"starts-with(@id,{_xpath_literal(prefix)}) "
+        "and "
+        f"substring(@id, string-length(@id) - string-length({_xpath_literal(suffix)}) + 1) = {_xpath_literal(suffix)}"
+        "]"
+    )
+    return css, xpath
 
 
 def _escape_css_string(value: str) -> str:
@@ -201,6 +262,30 @@ def _build_candidate_drafts(element: ElementHandle, summary: ElementSummary) -> 
     for attr in STABLE_ATTRS:
         value = summary.attributes.get(attr)
         if not value:
+            continue
+
+        if attr == "id" and is_dynamic_id(value):
+            partial_locators = build_dynamic_id_partial_locators(value)
+            if partial_locators:
+                partial_css, partial_xpath = partial_locators
+                _add_unique(
+                    drafts,
+                    CandidateDraft(
+                        locator_type="CSS",
+                        locator=partial_css,
+                        rule="stable_attr:id_partial",
+                    ),
+                    seen,
+                )
+                _add_unique(
+                    drafts,
+                    CandidateDraft(
+                        locator_type="XPath",
+                        locator=partial_xpath,
+                        rule="stable_attr:id_partial",
+                    ),
+                    seen,
+                )
             continue
 
         css = _stable_attr_css(tag, attr, value)
