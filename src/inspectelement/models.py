@@ -52,6 +52,15 @@ class LocatorCandidate:
 
 
 @dataclass(slots=True)
+class OverrideEntry:
+    hostname: str
+    element_signature: str
+    locator_type: LocatorType
+    locator: str
+    created_at: str
+
+
+@dataclass(slots=True)
 class PageContext:
     url: str
     hostname: str

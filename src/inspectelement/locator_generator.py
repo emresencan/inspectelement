@@ -7,6 +7,7 @@ from typing import Any, Iterable, Sequence
 from playwright.sync_api import ElementHandle, Page
 
 from .models import ElementSummary, LocatorCandidate
+from .selector_rules import ROOT_ID_BLOCKLIST_LOWER, is_blocked_root_id
 from .scoring import score_candidates
 
 _DYNAMIC_CLASS_PATTERNS = [
@@ -20,8 +21,6 @@ _DYNAMIC_CLASS_PATTERNS = [
 
 STABLE_ATTRS = ("data-testid", "data-test", "data-qa", "aria-label", "name", "id")
 PROMOTABLE_STABLE_ATTRS = ("data-testid", "id", "name", "aria-label")
-ROOT_ID_BLOCKLIST = {"__next", "root", "app", "__nuxt", "gatsby-focus-wrapper"}
-_ROOT_ID_BLOCKLIST_LOWER = {item.lower() for item in ROOT_ID_BLOCKLIST}
 _DYNAMIC_ID_TOKEN_PATTERNS = (
     re.compile(r"^jdt_\d+$", re.IGNORECASE),
     re.compile(r"^j_idt\d+$", re.IGNORECASE),
@@ -200,7 +199,7 @@ def _nearest_stable_ancestor(element: ElementHandle) -> dict[str, str] | None:
     return element.evaluate(
         """
         (el) => {
-          const attrs = ['data-testid', 'data-test', 'data-qa', 'aria-label', 'name', 'id'];
+          const attrs = ['data-testid', 'data-test', 'data-qa', 'aria-label', 'name'];
           let current = el.parentElement;
           while (current) {
             for (const attr of attrs) {
@@ -259,10 +258,9 @@ def _stable_attr_css(tag: str, attr: str, value: str) -> str:
 
 def _is_blocked_id(tag: str, value: str) -> bool:
     normalized_tag = tag.strip().lower()
-    normalized_id = value.strip().lower()
     if normalized_tag in {"html", "body"}:
         return True
-    if normalized_id in _ROOT_ID_BLOCKLIST_LOWER:
+    if is_blocked_root_id(value):
         return True
     return False
 
@@ -365,8 +363,9 @@ def _build_promoted_clickable_ancestor_drafts(page: Page, element: ElementHandle
         value = attrs.get(attr)
         if not value or not isinstance(value, str):
             continue
-        if attr == "id" and is_dynamic_id(value):
-            continue
+        if attr == "id":
+            if is_dynamic_id(value) or _is_blocked_id(tag, value):
+                continue
 
         css = _stable_attr_css(tag, attr, value)
         try:
@@ -432,6 +431,13 @@ def _prune_descendant_css_locator(page: Page, locator: str) -> str:
     parent = extract_css_parent_if_descendant(locator)
     if not parent:
         return locator
+    parent_lower = parent.strip().lower()
+    if parent_lower in {"html", "body"}:
+        return locator
+    if parent.startswith("#"):
+        parent_id = parent[1:].strip().lower()
+        if parent_id in ROOT_ID_BLOCKLIST_LOWER:
+            return locator
     try:
         if len(page.query_selector_all(parent)) == 1:
             return parent
@@ -463,6 +469,41 @@ def _prune_descendant_css_drafts(page: Page, drafts: Iterable[CandidateDraft]) -
         seen.add(key)
         pruned.append(updated)
     return pruned
+
+
+def _ensure_xpath_text_in_results(
+    scored: list[LocatorCandidate],
+    summary: ElementSummary,
+    limit: int,
+) -> list[LocatorCandidate]:
+    if limit <= 0:
+        return []
+
+    top = scored[:limit]
+    if not _short_text(summary.text):
+        return top
+
+    has_xpath_text = any(
+        candidate.rule == "xpath_text" and candidate.locator_type == "XPath"
+        for candidate in top
+    )
+    if has_xpath_text:
+        return top
+
+    best_xpath_text = next(
+        (
+            candidate
+            for candidate in scored
+            if candidate.rule == "xpath_text" and candidate.locator_type == "XPath"
+        ),
+        None,
+    )
+    if not best_xpath_text:
+        return top
+    if not top:
+        return [best_xpath_text]
+
+    return top[:-1] + [best_xpath_text]
 
 
 def _build_candidate_drafts(element: ElementHandle, summary: ElementSummary) -> list[CandidateDraft]:
@@ -533,6 +574,18 @@ def _build_candidate_drafts(element: ElementHandle, summary: ElementSummary) -> 
         )
 
     short_text = _short_text(summary.text)
+    if short_text:
+        xpath_tag = tag if tag else "*"
+        _add_unique(
+            drafts,
+            CandidateDraft(
+                locator_type="XPath",
+                locator=f"//{xpath_tag}[normalize-space()={_xpath_literal(short_text)}]",
+                rule="xpath_text",
+            ),
+            seen,
+        )
+
     if short_text and tag in {"button", "a"}:
         role = summary.role or ("button" if tag == "button" else "link")
         _add_unique(
@@ -552,15 +605,6 @@ def _build_candidate_drafts(element: ElementHandle, summary: ElementSummary) -> 
                 locator=f'page.locator("{tag}", has_text="{short_text}")',
                 rule="text_role",
                 metadata={"playwright_kind": "locator_has_text", "tag": tag, "text": short_text},
-            ),
-            seen,
-        )
-        _add_unique(
-            drafts,
-            CandidateDraft(
-                locator_type="XPath",
-                locator=f"//{tag}[normalize-space()={_xpath_literal(short_text)}]",
-                rule="xpath_text",
             ),
             seen,
         )
@@ -646,11 +690,23 @@ def generate_locator_candidates(
     limit: int = 5,
 ) -> list[LocatorCandidate]:
     promoted = _build_promoted_clickable_ancestor_drafts(page, element)
+    short_text = _short_text(summary.text)
     if promoted:
         drafts = promoted
     else:
         drafts = _build_candidate_drafts(element, summary)
+
+    if promoted and short_text:
+        xpath_tag = summary.tag if summary.tag else "*"
+        drafts.append(
+            CandidateDraft(
+                locator_type="XPath",
+                locator=f"//{xpath_tag}[normalize-space()={_xpath_literal(short_text)}]",
+                rule="xpath_text",
+            )
+        )
+
     drafts = _prune_descendant_css_drafts(page, drafts)
     candidates = _validate_drafts(page, drafts)
     scored = score_candidates(candidates, learning_weights)
-    return scored[:limit]
+    return _ensure_xpath_text_in_results(scored, summary, limit)

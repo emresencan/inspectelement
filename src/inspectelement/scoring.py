@@ -6,6 +6,7 @@ from typing import Iterable
 from .models import LocatorCandidate, ScoreBreakdown
 
 BASE_RULE_SCORES: dict[str, float] = {
+    "custom_override": 320.0,
     # 1) ID FIRST
     "stable_attr:id": 110.0,  # stabil id (en üst)
     "stable_attr:id_partial": 98.0,  # id dinamikse partial match
