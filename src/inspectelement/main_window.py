@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -66,6 +67,9 @@ class MainWindow(QMainWindow):
 
         self.copy_best_button = QPushButton("Copy best")
         self.copy_best_button.clicked.connect(self._copy_best)
+        self.output_format_combo = QComboBox()
+        self.output_format_combo.addItems(["Best", "CSS", "XPath", "Playwright", "Selenium"])
+        self.output_format_combo.setCurrentText("Best")
 
         self.reset_learning_button = QPushButton("Reset learning")
         self.reset_learning_button.clicked.connect(self._reset_learning)
@@ -127,6 +131,7 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.url_input)
         top_bar.addWidget(self.launch_button)
         top_bar.addWidget(self.inspect_toggle)
+        top_bar.addWidget(self.output_format_combo)
         top_bar.addWidget(self.copy_best_button)
         top_bar.addWidget(self.reset_learning_button)
 
@@ -197,7 +202,16 @@ class MainWindow(QMainWindow):
         if not self.current_candidates:
             self._set_status("No locator candidates yet.")
             return
-        self._copy(self.current_candidates[0].locator)
+        selected_format = self.output_format_combo.currentText()
+        if selected_format == "Best":
+            self._copy(self.current_candidates[0].locator)
+            return
+
+        for candidate in self.current_candidates:
+            if candidate.locator_type == selected_format:
+                self._copy(candidate.locator)
+                return
+        self._set_status("No candidate for selected format")
 
     def _reset_learning(self) -> None:
         self.browser.reset_learning()
