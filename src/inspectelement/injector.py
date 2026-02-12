@@ -180,17 +180,25 @@ INJECT_SCRIPT = r"""
 
 
 def ensure_injected(page: Page, enabled: bool) -> None:
-    page.evaluate(INJECT_SCRIPT)
-    page.evaluate("(isEnabled) => window.__inspectelementSetEnabled(!!isEnabled)", enabled)
+    for frame in page.frames:
+        try:
+            frame.evaluate(INJECT_SCRIPT)
+            frame.evaluate("(isEnabled) => window.__inspectelementSetEnabled(!!isEnabled)", enabled)
+        except Exception:
+            continue
 
 
 def disable_overlay(page: Page) -> None:
-    page.evaluate(
-        """
-        () => {
-            if (window.__inspectelementSetEnabled) {
-                window.__inspectelementSetEnabled(false);
-            }
-        }
-        """
-    )
+    for frame in page.frames:
+        try:
+            frame.evaluate(
+                """
+                () => {
+                    if (window.__inspectelementSetEnabled) {
+                        window.__inspectelementSetEnabled(false);
+                    }
+                }
+                """
+            )
+        except Exception:
+            continue

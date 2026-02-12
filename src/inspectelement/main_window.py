@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QIcon
+from PySide6.QtGui import QCloseEvent, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -38,7 +38,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("inspectelement")
-        self.resize(1280, 820)
+        self._fit_window_to_screen()
         self._set_icon()
 
         self.bridge = EventBridge()
@@ -78,6 +78,8 @@ class MainWindow(QMainWindow):
         self.reset_learning_button.clicked.connect(self._reset_learning)
         self.clear_overrides_button = QPushButton("Clear Overrides")
         self.clear_overrides_button.clicked.connect(self._clear_overrides)
+        self.exit_button = QPushButton("Exit")
+        self.exit_button.clicked.connect(self.close)
 
         self.results_table = QTableWidget(0, 4)
         self.results_table.setHorizontalHeaderLabels(["Rank", "Type", "Locator", "Score"])
@@ -86,14 +88,27 @@ class MainWindow(QMainWindow):
         self.results_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.results_table.setShowGrid(True)
+        self.results_table.setGridStyle(Qt.PenStyle.SolidLine)
+        self.results_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.results_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.results_table.horizontalHeader().setStretchLastSection(False)
-        self.results_table.horizontalHeader().setSectionResizeMode(0, self.results_table.horizontalHeader().ResizeMode.ResizeToContents)
-        self.results_table.horizontalHeader().setSectionResizeMode(1, self.results_table.horizontalHeader().ResizeMode.ResizeToContents)
+        self.results_table.horizontalHeader().setSectionResizeMode(0, self.results_table.horizontalHeader().ResizeMode.Fixed)
+        self.results_table.horizontalHeader().setSectionResizeMode(1, self.results_table.horizontalHeader().ResizeMode.Fixed)
         self.results_table.horizontalHeader().setSectionResizeMode(2, self.results_table.horizontalHeader().ResizeMode.Stretch)
-        self.results_table.horizontalHeader().setSectionResizeMode(3, self.results_table.horizontalHeader().ResizeMode.ResizeToContents)
+        self.results_table.horizontalHeader().setSectionResizeMode(3, self.results_table.horizontalHeader().ResizeMode.Fixed)
+        self.results_table.setColumnWidth(0, 70)
+        self.results_table.setColumnWidth(1, 110)
+        self.results_table.setColumnWidth(3, 96)
+        self.results_table.verticalHeader().setDefaultSectionSize(36)
+        self.results_table.setMinimumHeight(225)
+        self.results_table.setMaximumHeight(245)
 
         self.detail_labels: dict[str, QLabel] = {}
         detail_form = QFormLayout()
+        detail_form.setContentsMargins(0, 0, 0, 0)
+        detail_form.setHorizontalSpacing(12)
+        detail_form.setVerticalSpacing(4)
         for key in ["tag", "id", "classes", "name", "role", "text", "placeholder", "aria-label"]:
             label = QLabel("-")
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -104,6 +119,7 @@ class MainWindow(QMainWindow):
         self.breakdown_text = QPlainTextEdit()
         self.breakdown_text.setReadOnly(True)
         self.breakdown_text.setPlaceholderText("Select a locator row to inspect score details")
+        self.breakdown_text.setMaximumHeight(120)
 
         self.good_button = QPushButton("Good")
         self.good_button.clicked.connect(lambda: self._feedback(True))
@@ -119,18 +135,20 @@ class MainWindow(QMainWindow):
         self.locator_editor = QPlainTextEdit()
         self.locator_editor.setPlaceholderText("Select a locator row, edit it here, then apply/copy/save.")
         self.locator_editor.setObjectName("Editor")
+        self.locator_editor.setMaximumHeight(96)
 
         feedback_row = QHBoxLayout()
         feedback_row.addWidget(self.good_button)
         feedback_row.addWidget(self.bad_button)
-        feedback_row.addWidget(self.good_edited_button)
 
         editor_actions_row = QHBoxLayout()
         editor_actions_row.addWidget(self.apply_edit_button)
         editor_actions_row.addWidget(self.copy_edited_button)
+        editor_actions_row.addWidget(self.good_edited_button)
 
         header_card = QFrame()
         header_card.setObjectName("Card")
+        header_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         header_layout = QVBoxLayout(header_card)
 
         title_label = QLabel("Inspect Element for Automation")
@@ -149,6 +167,7 @@ class MainWindow(QMainWindow):
         )
         quick_start.setObjectName("Help")
         quick_start.setWordWrap(True)
+        quick_start.setMaximumHeight(100)
 
         header_layout.addWidget(title_label)
         header_layout.addWidget(subtitle_label)
@@ -156,6 +175,7 @@ class MainWindow(QMainWindow):
 
         controls_card = QFrame()
         controls_card.setObjectName("Card")
+        controls_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         controls_layout = QGridLayout(controls_card)
         controls_layout.setColumnStretch(1, 1)
 
@@ -173,6 +193,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.copy_best_button, 1, 4)
         controls_layout.addWidget(self.reset_learning_button, 1, 5)
         controls_layout.addWidget(self.clear_overrides_button, 1, 6)
+        controls_layout.addWidget(self.exit_button, 1, 7)
 
         left_card = QFrame()
         left_card.setObjectName("Card")
@@ -184,6 +205,9 @@ class MainWindow(QMainWindow):
         left_col.addWidget(left_title)
         left_col.addWidget(left_hint)
         left_col.addWidget(self.results_table)
+        left_col.addWidget(QLabel("Locator Editor:"))
+        left_col.addWidget(self.locator_editor)
+        left_col.addLayout(editor_actions_row)
 
         details_card = QFrame()
         details_card.setObjectName("Card")
@@ -192,12 +216,10 @@ class MainWindow(QMainWindow):
         details_title.setObjectName("SectionTitle")
         right_col.addWidget(details_title)
         right_col.addLayout(detail_form)
-        right_col.addWidget(QLabel("Locator Editor:"))
-        right_col.addWidget(self.locator_editor)
-        right_col.addLayout(editor_actions_row)
         right_col.addWidget(QLabel("Score breakdown:"))
         right_col.addWidget(self.breakdown_text)
         right_col.addLayout(feedback_row)
+        right_col.addStretch(1)
 
         content_layout = QHBoxLayout()
         content_layout.addWidget(left_card, 3)
@@ -209,6 +231,8 @@ class MainWindow(QMainWindow):
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(8)
         root_layout.addWidget(header_card)
         root_layout.addWidget(controls_card)
         root_layout.addLayout(content_layout)
@@ -224,6 +248,21 @@ class MainWindow(QMainWindow):
         self._toast_timer.timeout.connect(self.toast_label.hide)
 
         self._apply_style()
+
+    def _fit_window_to_screen(self) -> None:
+        screen = QGuiApplication.primaryScreen()
+        if not screen:
+            self.resize(1200, 700)
+            return
+
+        available = screen.availableGeometry()
+        target_width = max(980, min(1320, available.width() - 48))
+        target_height = max(600, min(720, available.height() - 72))
+        target_width = min(target_width, available.width() - 16)
+        target_height = min(target_height, available.height() - 16)
+        x = available.x() + max(8, (available.width() - target_width) // 2)
+        y = available.y() + max(8, (available.height() - target_height) // 2)
+        self.setGeometry(x, y, target_width, target_height)
 
     def _set_icon(self) -> None:
         icon_path = Path(__file__).resolve().parents[2] / "assets" / "icon.png"
@@ -290,6 +329,11 @@ class MainWindow(QMainWindow):
                 background: #ffffff;
                 color: #0f172a;
             }
+            QPushButton#TableCopyButton {
+                padding: 3px 8px;
+                min-height: 26px;
+                font-weight: 600;
+            }
             QPushButton:hover {
                 background: #f1f5f9;
             }
@@ -304,6 +348,26 @@ class MainWindow(QMainWindow):
                 border: 1px solid #cbd5e1;
                 border-radius: 8px;
                 padding: 6px 8px;
+            }
+            QTableWidget {
+                gridline-color: #94a3b8;
+                selection-background-color: #dbeafe;
+                selection-color: #0f172a;
+            }
+            QTableWidget::item:selected {
+                background: #dbeafe;
+                color: #0f172a;
+            }
+            QTableWidget::item:selected:active {
+                background: #bfdbfe;
+                color: #0f172a;
+            }
+            QTableWidget::item:selected:!active {
+                background: #dbeafe;
+                color: #0f172a;
+            }
+            QWidget#LocatorCell {
+                background: transparent;
             }
             QComboBox {
                 padding-right: 24px;
@@ -502,19 +566,32 @@ class MainWindow(QMainWindow):
             self.results_table.setItem(row, 3, score_item)
 
             locator_cell = QWidget()
+            locator_cell.setObjectName("LocatorCell")
             locator_layout = QHBoxLayout(locator_cell)
-            locator_layout.setContentsMargins(6, 1, 6, 1)
+            locator_layout.setContentsMargins(6, 3, 6, 3)
+            locator_layout.setSpacing(6)
 
             locator_label = QLabel(candidate.locator)
+            locator_label.setObjectName("LocatorText")
             locator_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             locator_label.setWordWrap(False)
+            locator_label.setTextFormat(Qt.TextFormat.PlainText)
+            locator_label.setProperty("full_locator", candidate.locator)
+            locator_label.setToolTip(candidate.locator)
+            locator_label.setMinimumWidth(0)
+            locator_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            locator_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
             copy_button = QPushButton("Copy")
+            copy_button.setObjectName("TableCopyButton")
+            copy_button.setFixedSize(72, 28)
             copy_button.clicked.connect(lambda _checked=False, text=candidate.locator: self._copy(text))
 
             locator_layout.addWidget(locator_label, 1)
             locator_layout.addWidget(copy_button, 0)
             self.results_table.setCellWidget(row, 2, locator_cell)
+
+        self._update_locator_text_elide()
 
         if candidates:
             self.results_table.selectRow(0)
@@ -523,6 +600,25 @@ class MainWindow(QMainWindow):
         else:
             self.breakdown_text.clear()
             self.locator_editor.clear()
+
+    def _locator_text_width(self) -> int:
+        column_width = self.results_table.columnWidth(2)
+        # margins + spacing + fixed copy button width
+        reserved = 6 + 6 + 6 + 72
+        return max(120, column_width - reserved)
+
+    def _update_locator_text_elide(self) -> None:
+        max_width = self._locator_text_width()
+        for row in range(self.results_table.rowCount()):
+            cell = self.results_table.cellWidget(row, 2)
+            if not cell:
+                continue
+            label = cell.findChild(QLabel, "LocatorText")
+            if not label:
+                continue
+            full_locator = label.property("full_locator")
+            if isinstance(full_locator, str):
+                label.setText(label.fontMetrics().elidedText(full_locator, Qt.TextElideMode.ElideRight, max_width))
 
     def _selected_candidate(self) -> LocatorCandidate | None:
         selected = self.results_table.selectionModel().selectedRows()
@@ -568,6 +664,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        self._update_locator_text_elide()
         if self.toast_label.isVisible():
             self._position_toast()
         super().resizeEvent(event)
