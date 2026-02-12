@@ -1,4 +1,14 @@
--e .
-playwright>=1.50.0
-PySide6>=6.7.0
-pytest>=8.0.0
+greenlet==3.3.1
+iniconfig==2.3.0
+-e git+https://github.com/emresencan/inspectelement@6a76e2ab5c9f52ee8564405a51ac7499d0146681#egg=inspectelement
+packaging==26.0
+playwright==1.58.0
+pluggy==1.6.0
+pyee==13.0.0
+Pygments==2.19.2
+PySide6==6.10.2
+PySide6_Addons==6.10.2
+PySide6_Essentials==6.10.2
+pytest==9.0.2
+shiboken6==6.10.2
+typing_extensions==4.15.0

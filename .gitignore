@@ -1,39 +1,26 @@
-cat > .gitignore <<'EOF'
-# ---- Python ----
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-.pytype/
-*.log
-
-# ---- Virtualenv ----
+# Python venv
 .venv/
 venv/
 ENV/
 env/
-pip-wheel-metadata/
 
-# ---- Build / packaging ----
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Build / dist
 build/
 dist/
 *.egg-info/
-.eggs/
-*.spec
-
-# ---- IDE / OS ----
-.DS_Store
-.idea/
-.vscode/
-*.iml
-
-# ---- Playwright / browsers / artifacts ----
-playwright/.cache/
-ms-playwright/
-test-results/
-trace.zip
-EOF
