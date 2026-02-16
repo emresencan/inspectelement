@@ -5,10 +5,11 @@ from pathlib import Path
 import re
 import sys
 
-from PySide6.QtCore import QObject, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -16,6 +17,8 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QLayout,
+    QLayoutItem,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -31,12 +34,24 @@ from PySide6.QtWidgets import (
 )
 
 from .browser_manager import BrowserManager
+from .action_catalog import (
+    ACTION_PRESETS,
+    CATEGORY_FILTERS,
+    ActionSignaturePreview,
+    action_label,
+    build_signature_previews,
+    filter_action_specs,
+    has_combo_actions,
+    has_table_actions,
+    normalize_selected_actions,
+    required_parameter_keys,
+    return_kind_badge,
+)
 from .context_wizard import ContextSelection, ContextWizardDialog
 from .diff_preview_dialog import DiffPreviewDialog
 from .java_pom_writer import (
     JavaPreview,
     apply_java_preview,
-    build_action_method_signature_preview,
     generate_java_preview,
 )
 from .locator_recommendation import recommend_locator_candidates
@@ -51,25 +66,75 @@ class EventBridge(QObject):
     page_changed = Signal(str, str)
 
 
-ACTION_PICKER_ITEMS: tuple[tuple[str, str, str, str, str], ...] = (
-    ("clickElement", "Click", "clickElement", "Standard click using BaseLibrary.", "Fluent (returns this)"),
-    ("javaScriptClicker", "Click", "javaScriptClicker", "JavaScript click fallback.", "Fluent (returns this)"),
-    ("getText", "Read", "getText", "Reads visible text.", "Returns String"),
-    ("getAttribute", "Read", "getAttribute", "Reads selected attribute.", "Returns String"),
-    ("javaScriptGetInnerText", "Read", "javaScriptGetInnerText", "Reads innerText via JavaScript.", "Returns String"),
-    ("javaScriptGetValue", "Read", "javaScriptGetValue", "Reads value via JavaScript.", "Returns String"),
-    ("isElementDisplayed", "State", "isElementDisplayed", "Checks displayed state with timeout.", "Returns boolean"),
-    ("isElementEnabled", "State", "isElementEnabled", "Checks enabled state with timeout.", "Returns boolean"),
-    ("scrollToElement", "Scroll", "scrollToElement", "Scrolls into view before interaction.", "Fluent (returns this)"),
-    (
-        "javaScriptClearAndSetValue",
-        "JS Input",
-        "javaScriptClearAndSetValue",
-        "Clears and sets value via JavaScript.",
-        "Fluent (returns this)",
-    ),
-)
-ACTION_PICKER_ORDER: tuple[str, ...] = ("Click", "Read", "State", "Scroll", "JS Input")
+class FlowLayout(QLayout):
+    def __init__(self, parent: QWidget | None = None, margin: int = 0, spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> QLayoutItem | None:
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int) -> QLayoutItem | None:
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self) -> Qt.Orientations:
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        x = rect.x()
+        y = rect.y()
+        line_height = 0
+        spacing = self.spacing()
+
+        for item in self._items:
+            item_size = item.sizeHint()
+            next_x = x + item_size.width() + spacing
+            if next_x - spacing > rect.right() and line_height > 0:
+                x = rect.x()
+                y += line_height + spacing
+                next_x = x + item_size.width() + spacing
+                line_height = 0
+
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), item_size))
+
+            x = next_x
+            line_height = max(line_height, item_size.height())
+
+        return y + line_height - rect.y()
 
 
 class MainWindow(QMainWindow):
@@ -142,10 +207,73 @@ class MainWindow(QMainWindow):
 
         self.element_name_input = QLineEdit()
         self.element_name_input.setPlaceholderText("Element name (e.g. KURAL_ADI_TXT)")
-        self.element_name_input.textChanged.connect(self._update_add_button_state)
+        self.element_name_input.textChanged.connect(self._on_element_name_changed)
 
-        self.action_checkboxes: dict[str, QCheckBox] = {}
-        self.action_preview_labels: dict[str, QLabel] = {}
+        self.selected_actions: list[str] = []
+        self.current_action_category: str = "All"
+        self.show_advanced_actions = True
+        self.preview_locator_name_override: str | None = None
+        self.preview_signatures_override: list[str] | None = None
+        self.preview_signatures_actions_snapshot: tuple[str, ...] = ()
+        self.pick_table_root_mode = False
+        self.auto_table_root_selector_type: str | None = None
+        self.auto_table_root_selector_value: str | None = None
+        self.auto_table_root_locator_name: str | None = None
+        self.manual_table_root_selector_type: str | None = None
+        self.manual_table_root_selector_value: str | None = None
+        self.manual_table_root_locator_name: str | None = None
+
+        self.action_filter_group = QButtonGroup(self)
+        self.action_filter_group.setExclusive(True)
+        self.action_filter_buttons: dict[str, QPushButton] = {}
+        self.selected_action_flow: FlowLayout | None = None
+        self.available_action_specs = []
+
+        self.action_search_input = QLineEdit()
+        self.action_search_input.setPlaceholderText("Search action by name or description")
+        self.action_search_input.textChanged.connect(self._refresh_action_dropdown)
+
+        self.action_dropdown = QComboBox()
+        self.action_dropdown.currentIndexChanged.connect(self._on_action_dropdown_changed)
+        self.action_dropdown.activated.connect(self._on_action_dropdown_activated)
+
+        self.action_add_button = QPushButton("+ Add action")
+        self.action_add_button.clicked.connect(self._add_selected_dropdown_action)
+
+        self.advanced_actions_checkbox = QCheckBox("Show advanced")
+        self.advanced_actions_checkbox.setChecked(True)
+        self.advanced_actions_checkbox.toggled.connect(self._on_show_advanced_toggled)
+
+        self.generated_methods_preview = QPlainTextEdit()
+        self.generated_methods_preview.setReadOnly(True)
+        self.generated_methods_preview.setObjectName("GeneratedPreview")
+        self.generated_methods_preview.setMaximumHeight(138)
+        self.generated_methods_preview.setPlaceholderText("Select actions to preview generated method signatures.")
+
+        self.table_root_section = QFrame()
+        self.table_root_section.setObjectName("TableRootSection")
+        self.table_root_locator_preview = QLineEdit()
+        self.table_root_locator_preview.setReadOnly(True)
+        self.pick_table_root_button = QPushButton("Pick Table Root")
+        self.pick_table_root_button.clicked.connect(self._start_table_root_pick_mode)
+        self.clear_table_root_button = QPushButton("Clear Override")
+        self.clear_table_root_button.clicked.connect(self._clear_manual_table_root)
+
+        self.parameter_panel = QFrame()
+        self.parameter_panel.setObjectName("ActionParamsPanel")
+        self.param_timeout_input = QLineEdit("10")
+        self.param_column_header_input = QLineEdit()
+        self.param_expected_text_input = QLineEdit()
+        self.param_filter_text_input = QLineEdit()
+        self.param_select_id_input = QLineEdit()
+        self.param_wait_before_select_checkbox = QCheckBox("waitBeforeSelect")
+        self.param_match_type_combo = QComboBox()
+        self.param_match_type_combo.addItems(["equals", "contains"])
+        self.param_match_column_input = QLineEdit()
+        self.param_match_text_input = QLineEdit()
+        self.param_inner_locator_input = QLineEdit()
+        self.param_widgets: dict[str, QWidget] = {}
+
         self.action_picker_widget = self._build_action_picker()
 
         self.log_language_combo = QComboBox()
@@ -310,6 +438,10 @@ class MainWindow(QMainWindow):
         left_col.addWidget(self.element_name_input)
         left_col.addWidget(QLabel("Action Picker:"))
         left_col.addWidget(self.action_picker_widget)
+        left_col.addWidget(self._build_table_root_section())
+        left_col.addWidget(self._build_parameter_panel())
+        left_col.addWidget(QLabel("Generated Methods Preview:"))
+        left_col.addWidget(self.generated_methods_preview)
 
         action_row = QHBoxLayout()
         action_row.addWidget(QLabel("Log:"))
@@ -361,6 +493,9 @@ class MainWindow(QMainWindow):
         self._toast_timer.timeout.connect(self.toast_label.hide)
 
         self._apply_style()
+        self._refresh_table_root_section()
+        self._refresh_parameter_panel()
+        self._update_generated_methods_preview()
         if not self._ensure_context_selected(initial=True):
             QTimer.singleShot(0, self.close)
 
@@ -529,27 +664,52 @@ class MainWindow(QMainWindow):
             QFrame#ActionPickerCard {
                 border: 1px solid #d5deec;
                 border-radius: 10px;
-                background: #f8fbff;
+                background: #f8fafc;
             }
-            QLabel#ActionCategory {
-                color: #0f172a;
-                font-weight: 700;
-                margin-top: 2px;
-            }
-            QFrame#ActionRow {
-                border: 1px solid #deebf8;
+            QFrame#ActionChipTray {
+                border: 1px solid #d7dfed;
                 border-radius: 8px;
                 background: #ffffff;
             }
-            QLabel#ActionReturn {
-                color: #0b5f97;
-                font-size: 11px;
-                font-weight: 600;
+            QPushButton#ActionChip {
+                border: 1px solid #bfd6ec;
+                border-radius: 12px;
+                padding: 2px 8px;
+                font-size: 12px;
+                background: #eef6ff;
             }
-            QLabel#ActionPreview {
-                color: #334155;
-                font-family: "Menlo", "Consolas", monospace;
+            QPushButton#ActionChip:hover {
+                background: #dbeafe;
+            }
+            QPushButton#FilterChip {
+                border: 1px solid #cad6e5;
+                border-radius: 10px;
+                padding: 3px 8px;
                 font-size: 11px;
+            }
+            QPushButton#FilterChip:checked {
+                background: #0ea5e9;
+                color: #ffffff;
+                border-color: #0284c7;
+            }
+            QPushButton#PresetChip {
+                border: 1px solid #cad6e5;
+                border-radius: 10px;
+                padding: 3px 8px;
+                font-size: 11px;
+                background: #ffffff;
+            }
+            QPushButton#PresetChip:hover {
+                background: #eef2ff;
+            }
+            QPlainTextEdit#GeneratedPreview {
+                font-family: "Menlo", "Consolas", monospace;
+                font-size: 12px;
+            }
+            QFrame#TableRootSection, QFrame#ActionParamsPanel {
+                border: 1px solid #d7dfed;
+                border-radius: 8px;
+                background: #ffffff;
             }
             """
         )
@@ -563,89 +723,427 @@ class MainWindow(QMainWindow):
         container = QFrame()
         container.setObjectName("ActionPickerCard")
         root_layout = QVBoxLayout(container)
-        root_layout.setContentsMargins(10, 10, 10, 10)
-        root_layout.setSpacing(8)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(6)
 
-        grouped: dict[str, list[tuple[str, str, str, str, str]]] = {category: [] for category in ACTION_PICKER_ORDER}
-        for item in ACTION_PICKER_ITEMS:
-            grouped.setdefault(item[1], []).append(item)
+        selected_row = QHBoxLayout()
+        selected_row.setContentsMargins(0, 0, 0, 0)
+        selected_row.addWidget(QLabel("Selected Actions:"))
+        selected_row.addStretch(1)
+        root_layout.addLayout(selected_row)
 
-        for category in ACTION_PICKER_ORDER:
-            category_items = grouped.get(category, [])
-            if not category_items:
-                continue
+        chip_tray = QFrame()
+        chip_tray.setObjectName("ActionChipTray")
+        chip_tray_layout = QVBoxLayout(chip_tray)
+        chip_tray_layout.setContentsMargins(8, 8, 8, 8)
+        chip_tray_layout.setSpacing(0)
+        chips_host = QWidget()
+        self.selected_action_flow = FlowLayout(chips_host, margin=0, spacing=6)
+        chips_host.setLayout(self.selected_action_flow)
+        chip_tray_layout.addWidget(chips_host)
+        root_layout.addWidget(chip_tray)
 
-            category_label = QLabel(category)
-            category_label.setObjectName("ActionCategory")
-            root_layout.addWidget(category_label)
+        add_row = QHBoxLayout()
+        add_row.setContentsMargins(0, 0, 0, 0)
+        add_row.setSpacing(6)
+        add_row.addWidget(QLabel("+ Add action"))
+        add_row.addWidget(self.action_search_input, 1)
+        add_row.addWidget(self.action_dropdown, 2)
+        add_row.addWidget(self.action_add_button)
+        root_layout.addLayout(add_row)
 
-            for action_key, _cat, action_label, description, return_hint in category_items:
-                row = QFrame()
-                row.setObjectName("ActionRow")
-                row_layout = QVBoxLayout(row)
-                row_layout.setContentsMargins(8, 8, 8, 8)
-                row_layout.setSpacing(3)
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(4)
+        filter_row.addWidget(QLabel("Filter:"))
+        for category in CATEGORY_FILTERS:
+            filter_button = QPushButton(category)
+            filter_button.setObjectName("FilterChip")
+            filter_button.setCheckable(True)
+            filter_button.clicked.connect(lambda _checked=False, value=category: self._set_category_filter(value))
+            self.action_filter_group.addButton(filter_button)
+            self.action_filter_buttons[category] = filter_button
+            filter_row.addWidget(filter_button)
+        filter_row.addSpacing(8)
+        filter_row.addWidget(self.advanced_actions_checkbox)
+        filter_row.addStretch(1)
+        root_layout.addLayout(filter_row)
 
-                top_line = QHBoxLayout()
-                top_line.setContentsMargins(0, 0, 0, 0)
-                top_line.setSpacing(6)
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.setSpacing(4)
+        preset_row.addWidget(QLabel("Presets:"))
+        for preset_name in ("Common UI", "Read", "JS", "Table Common", "ComboBox", "Clear"):
+            preset_button = QPushButton(preset_name)
+            preset_button.setObjectName("PresetChip")
+            preset_button.clicked.connect(lambda _checked=False, value=preset_name: self._apply_action_preset(value))
+            preset_row.addWidget(preset_button)
+        preset_row.addStretch(1)
+        root_layout.addLayout(preset_row)
 
-                action_checkbox = QCheckBox(action_label)
-                action_checkbox.toggled.connect(self._on_action_selection_changed)
-                action_checkbox.setObjectName("ActionToggle")
-
-                return_label = QLabel(return_hint)
-                return_label.setObjectName("ActionReturn")
-
-                top_line.addWidget(action_checkbox)
-                top_line.addStretch(1)
-                top_line.addWidget(return_label)
-
-                description_label = QLabel(description)
-                description_label.setObjectName("Muted")
-                description_label.setWordWrap(True)
-
-                preview_label = QLabel("")
-                preview_label.setObjectName("ActionPreview")
-                preview_label.setWordWrap(True)
-                preview_label.setVisible(False)
-
-                row_layout.addLayout(top_line)
-                row_layout.addWidget(description_label)
-                row_layout.addWidget(preview_label)
-                root_layout.addWidget(row)
-
-                self.action_checkboxes[action_key] = action_checkbox
-                self.action_preview_labels[action_key] = preview_label
+        self.action_filter_buttons["All"].setChecked(True)
+        self._refresh_action_dropdown()
+        self._render_selected_action_chips()
 
         return container
 
-    @staticmethod
-    def _action_label(action_key: str) -> str:
-        for key, _category, label, _description, _return_hint in ACTION_PICKER_ITEMS:
-            if key == action_key:
-                return label
-        return action_key
+    def _build_table_root_section(self) -> QWidget:
+        layout = QVBoxLayout(self.table_root_section)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        title = QLabel("Table Root")
+        title.setObjectName("FieldLabel")
+        hint = QLabel("Auto-detected from ancestry when table actions are selected.")
+        hint.setObjectName("Muted")
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.table_root_locator_preview, 1)
+        row.addWidget(self.pick_table_root_button)
+        row.addWidget(self.clear_table_root_button)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addLayout(row)
+        self.table_root_section.setVisible(False)
+        return self.table_root_section
 
-    def _refresh_action_signature_previews(self) -> None:
-        selected_page = self._selected_page_class()
-        page_class_name = selected_page.class_name if selected_page else "PageClass"
-        locator_name = self.element_name_input.text().strip() or "ELEMENT"
-        for action_key, checkbox in self.action_checkboxes.items():
-            preview_label = self.action_preview_labels[action_key]
-            if not checkbox.isChecked():
-                preview_label.clear()
-                preview_label.setVisible(False)
+    def _build_parameter_panel(self) -> QWidget:
+        self.parameter_form_layout = QFormLayout(self.parameter_panel)
+        layout = self.parameter_form_layout
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+        layout.addRow(QLabel("Action Parameters"), QLabel(""))
+
+        self.param_widgets = {
+            "timeoutSec": self.param_timeout_input,
+            "columnHeader": self.param_column_header_input,
+            "expectedText": self.param_expected_text_input,
+            "filterText": self.param_filter_text_input,
+            "selectId": self.param_select_id_input,
+            "waitBeforeSelect": self.param_wait_before_select_checkbox,
+            "matchType": self.param_match_type_combo,
+            "matchColumnHeader": self.param_match_column_input,
+            "matchText": self.param_match_text_input,
+            "innerLocator": self.param_inner_locator_input,
+        }
+
+        layout.addRow("timeoutSec", self.param_timeout_input)
+        layout.addRow("columnHeader", self.param_column_header_input)
+        layout.addRow("expectedText", self.param_expected_text_input)
+        layout.addRow("filterText", self.param_filter_text_input)
+        layout.addRow("selectId", self.param_select_id_input)
+        layout.addRow("waitBeforeSelect", self.param_wait_before_select_checkbox)
+        layout.addRow("matchType", self.param_match_type_combo)
+        layout.addRow("matchColumnHeader", self.param_match_column_input)
+        layout.addRow("matchText", self.param_match_text_input)
+        layout.addRow("innerLocator (By expression)", self.param_inner_locator_input)
+
+        for widget in self.param_widgets.values():
+            if isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self._on_action_selection_changed)
+            elif isinstance(widget, QCheckBox):
+                widget.toggled.connect(self._on_action_selection_changed)
+            elif isinstance(widget, QComboBox):
+                widget.currentTextChanged.connect(self._on_action_selection_changed)
+
+        self.parameter_panel.setVisible(False)
+        return self.parameter_panel
+
+    def _on_show_advanced_toggled(self, enabled: bool) -> None:
+        self.show_advanced_actions = bool(enabled)
+        self._refresh_action_dropdown()
+
+    def _set_category_filter(self, category: str) -> None:
+        if category not in CATEGORY_FILTERS:
+            category = "All"
+        self.current_action_category = category
+        for key, button in self.action_filter_buttons.items():
+            button.blockSignals(True)
+            button.setChecked(key == category)
+            button.blockSignals(False)
+        self._refresh_action_dropdown()
+
+    def _refresh_action_dropdown(self) -> None:
+        search_text = self.action_search_input.text()
+        filtered = filter_action_specs(
+            search_text=search_text,
+            category=self.current_action_category,
+            selected_actions=self.selected_actions,
+            include_advanced=self.show_advanced_actions,
+        )
+        self.available_action_specs = filtered
+
+        previous_key = self.action_dropdown.currentData()
+        self.action_dropdown.blockSignals(True)
+        self.action_dropdown.clear()
+        if not filtered:
+            self.action_dropdown.addItem("No actions found", None)
+            self.action_add_button.setEnabled(False)
+            self.action_dropdown.blockSignals(False)
+            return
+
+        selected_index = 0
+        for index, spec in enumerate(filtered):
+            item_text = f"{spec.label} ({spec.category}) - {spec.description}"
+            self.action_dropdown.addItem(item_text, spec.key)
+            if spec.key == previous_key:
+                selected_index = index
+
+        self.action_dropdown.setCurrentIndex(selected_index)
+        self.action_dropdown.blockSignals(False)
+        self.action_add_button.setEnabled(True)
+
+    def _on_action_dropdown_changed(self, _index: int) -> None:
+        self.action_add_button.setEnabled(self.action_dropdown.currentData() is not None)
+
+    def _on_action_dropdown_activated(self, _index: int) -> None:
+        self._add_selected_dropdown_action()
+
+    def _add_selected_dropdown_action(self) -> None:
+        action_key = self.action_dropdown.currentData()
+        if not isinstance(action_key, str):
+            return
+        self._add_action(action_key)
+        self.action_search_input.clear()
+        self._refresh_action_dropdown()
+
+    def _add_action(self, action_key: str) -> None:
+        if action_key in self.selected_actions:
+            self._show_toast("Already selected")
+            return
+
+        updated = self.selected_actions + [action_key]
+        self._set_selected_actions(updated)
+
+    def _remove_action(self, action_key: str) -> None:
+        updated = [key for key in self.selected_actions if key != action_key]
+        self._set_selected_actions(updated)
+
+    def _set_selected_actions(self, actions: list[str]) -> None:
+        normalized = normalize_selected_actions(actions)
+        if normalized == self.selected_actions:
+            return
+
+        self.selected_actions = normalized
+        self._reset_generated_preview_override()
+        self._render_selected_action_chips()
+        self._refresh_action_dropdown()
+        self._refresh_table_root_section()
+        self._refresh_parameter_panel()
+        self._on_action_selection_changed()
+
+    def _clear_selected_action_chips(self) -> None:
+        if not self.selected_action_flow:
+            return
+        while self.selected_action_flow.count():
+            item = self.selected_action_flow.takeAt(0)
+            if not item:
                 continue
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
 
-            signature = build_action_method_signature_preview(page_class_name, locator_name, action_key)
-            if not signature:
-                preview_label.clear()
-                preview_label.setVisible(False)
-                continue
+    def _render_selected_action_chips(self) -> None:
+        self._clear_selected_action_chips()
+        if not self.selected_action_flow:
+            return
 
-            preview_label.setText(f"Method Preview: {signature}")
-            preview_label.setVisible(True)
+        if not self.selected_actions:
+            placeholder = QLabel("No actions selected")
+            placeholder.setObjectName("Muted")
+            self.selected_action_flow.addWidget(placeholder)
+            return
+
+        for action_key in self.selected_actions:
+            chip_button = QPushButton(f"{action_label(action_key)}  x")
+            chip_button.setObjectName("ActionChip")
+            chip_button.clicked.connect(lambda _checked=False, key=action_key: self._remove_action(key))
+            self.selected_action_flow.addWidget(chip_button)
+
+    def _apply_action_preset(self, preset_name: str) -> None:
+        if preset_name == "Clear":
+            self._set_selected_actions([])
+            return
+
+        preset_actions = ACTION_PRESETS.get(preset_name)
+        if not preset_actions:
+            return
+        self._set_selected_actions(list(preset_actions))
+
+    def _refresh_table_root_section(self) -> None:
+        needs_table = has_table_actions(self.selected_actions)
+        self.table_root_section.setVisible(needs_table)
+        if not needs_table:
+            return
+
+        selector = self._selected_table_root_selector()
+        if selector:
+            selector_type, selector_value = selector
+            self.table_root_locator_preview.setText(f"{selector_type}: {selector_value}")
+        else:
+            self.table_root_locator_preview.setText("Table root could not be detected.")
+
+    def _refresh_parameter_panel(self) -> None:
+        required = set(required_parameter_keys(self.selected_actions))
+        self.parameter_panel.setVisible(bool(required))
+        for key, widget in self.param_widgets.items():
+            widget.setVisible(key in required)
+            label = self.parameter_form_layout.labelForField(widget)
+            if label:
+                label.setVisible(key in required)
+
+        if "selectId" in required:
+            candidate = self._selected_candidate()
+            resolved = self._resolve_java_selector(candidate) if candidate else None
+            if resolved and resolved[0] == "id":
+                self.param_select_id_input.setText(resolved[1])
+                self.param_select_id_input.setEnabled(False)
+            else:
+                self.param_select_id_input.setEnabled(True)
+        else:
+            self.param_select_id_input.setEnabled(True)
+
+    def _collect_action_parameters(self) -> dict[str, str]:
+        parameters: dict[str, str] = {
+            "timeoutSec": self.param_timeout_input.text().strip() or "10",
+            "columnHeader": self.param_column_header_input.text().strip(),
+            "expectedText": self.param_expected_text_input.text().strip(),
+            "filterText": self.param_filter_text_input.text().strip(),
+            "selectId": self.param_select_id_input.text().strip(),
+            "waitBeforeSelect": "true" if self.param_wait_before_select_checkbox.isChecked() else "false",
+            "matchType": self.param_match_type_combo.currentText().strip() or "equals",
+            "matchColumnHeader": self.param_match_column_input.text().strip(),
+            "matchText": self.param_match_text_input.text().strip(),
+            "innerLocator": self.param_inner_locator_input.text().strip(),
+        }
+        return parameters
+
+    def _selected_table_root_selector(self) -> tuple[str, str] | None:
+        if self.manual_table_root_selector_type and self.manual_table_root_selector_value:
+            return self.manual_table_root_selector_type, self.manual_table_root_selector_value
+        if self.auto_table_root_selector_type and self.auto_table_root_selector_value:
+            return self.auto_table_root_selector_type, self.auto_table_root_selector_value
+        return None
+
+    def _selected_table_root_locator_name(self) -> str:
+        if self.manual_table_root_locator_name:
+            return self.manual_table_root_locator_name
+        if self.auto_table_root_locator_name:
+            return self.auto_table_root_locator_name
+        base_name = self.element_name_input.text().strip().upper() or "TABLE"
+        if not base_name.endswith("_TABLE"):
+            base_name = f"{base_name}_TABLE"
+        return re.sub(r"[^A-Z0-9_]+", "_", base_name)
+
+    def _set_auto_table_root_from_summary(self, summary: ElementSummary | None) -> None:
+        if not summary or not summary.table_root:
+            self.auto_table_root_selector_type = None
+            self.auto_table_root_selector_value = None
+            self.auto_table_root_locator_name = None
+            self._refresh_table_root_section()
+            return
+
+        selector_type = summary.table_root.get("selector_type")
+        selector_value = summary.table_root.get("selector_value")
+        locator_name_hint = summary.table_root.get("locator_name_hint")
+        if selector_type and selector_value:
+            self.auto_table_root_selector_type = selector_type
+            self.auto_table_root_selector_value = selector_value
+            self.auto_table_root_locator_name = locator_name_hint or self._selected_table_root_locator_name()
+        else:
+            self.auto_table_root_selector_type = None
+            self.auto_table_root_selector_value = None
+            self.auto_table_root_locator_name = None
+        self._refresh_table_root_section()
+
+    def _set_manual_table_root(self, selector_type: str, selector_value: str, locator_name: str | None = None) -> None:
+        self.manual_table_root_selector_type = selector_type
+        self.manual_table_root_selector_value = selector_value
+        if locator_name:
+            self.manual_table_root_locator_name = locator_name
+        else:
+            self.manual_table_root_locator_name = self._selected_table_root_locator_name()
+        self._refresh_table_root_section()
+
+    def _clear_manual_table_root(self) -> None:
+        self.manual_table_root_selector_type = None
+        self.manual_table_root_selector_value = None
+        self.manual_table_root_locator_name = None
+        self.pick_table_root_mode = False
+        self._set_status("Manual table root override cleared.")
+        self._refresh_table_root_section()
+        self._update_generated_methods_preview()
+
+    def _start_table_root_pick_mode(self) -> None:
+        self.pick_table_root_mode = True
+        self._set_status("Pick Table Root mode is ON. Click table root container in browser.")
+        self._show_toast("Table root pick mode ON")
+
+    def _reset_generated_preview_override(self) -> None:
+        self.preview_locator_name_override = None
+        self.preview_signatures_override = None
+        self.preview_signatures_actions_snapshot = ()
+
+    def _on_element_name_changed(self, _value: str) -> None:
+        self._reset_generated_preview_override()
+        self._update_add_button_state()
+
+    def _update_generated_methods_preview(self) -> None:
+        actions = self._selected_actions()
+        if not actions:
+            self.generated_methods_preview.setPlainText("No actions selected.")
+            return
+
+        page = self._selected_page_class()
+        page_class_name = page.class_name if page else "PageClass"
+        base_locator_name = self.element_name_input.text().strip() or "ELEMENT"
+        locator_name = self.preview_locator_name_override or base_locator_name
+        table_locator_name = self._selected_table_root_locator_name() if has_table_actions(actions) else None
+        action_parameters = self._collect_action_parameters()
+
+        lines: list[str] = []
+        use_override = (
+            self.preview_locator_name_override is not None
+            and self.preview_signatures_override is not None
+            and tuple(actions) == self.preview_signatures_actions_snapshot
+        )
+        if use_override:
+            for action_key, signature in zip(actions, self.preview_signatures_override):
+                preview_kind = "fluent"
+                previews = build_signature_previews(
+                    page_class_name,
+                    locator_name,
+                    [action_key],
+                    table_locator_name=table_locator_name,
+                    action_parameters=action_parameters,
+                )
+                if previews:
+                    preview_kind = previews[0].return_kind
+                lines.append(f"[{return_kind_badge(preview_kind)}] {signature}")
+        else:
+            previews: list[ActionSignaturePreview] = build_signature_previews(
+                page_class_name=page_class_name,
+                locator_name=locator_name,
+                selected_actions=actions,
+                table_locator_name=table_locator_name,
+                action_parameters=action_parameters,
+            )
+            for preview in previews:
+                lines.append(f"[{return_kind_badge(preview.return_kind)}] {preview.signature}")
+
+        if self.preview_locator_name_override:
+            lines.insert(0, f"Locator constant: {self.preview_locator_name_override}")
+        if has_table_actions(actions):
+            table_selector = self._selected_table_root_selector()
+            if table_selector:
+                lines.insert(0, f"Table root: {table_selector[0]}={table_selector[1]}")
+            else:
+                lines.insert(0, "Table root: not detected")
+        if has_combo_actions(actions):
+            lines.append(f"selectId={action_parameters.get('selectId', '') or '-'}")
+            lines.append(f"waitBeforeSelect={action_parameters.get('waitBeforeSelect', 'false')}")
+
+        self.generated_methods_preview.setPlainText("\n".join(lines) if lines else "No preview available.")
 
     @staticmethod
     def _build_logger() -> logging.Logger:
@@ -702,6 +1200,12 @@ class MainWindow(QMainWindow):
     def _apply_context(self, selection: ContextSelection) -> None:
         self.project_root = selection.project_root
         self.selected_module = selection.module
+        self.manual_table_root_selector_type = None
+        self.manual_table_root_selector_value = None
+        self.manual_table_root_locator_name = None
+        self.auto_table_root_selector_type = None
+        self.auto_table_root_selector_value = None
+        self.auto_table_root_locator_name = None
         self._refresh_page_classes()
 
         root_text = str(selection.project_root)
@@ -717,6 +1221,7 @@ class MainWindow(QMainWindow):
         self._set_status(f"Context loaded: {selection.module.name}. No page classes found.")
 
     def _refresh_page_classes(self) -> None:
+        self._reset_generated_preview_override()
         self.page_combo.clear()
         self.page_combo.addItem("Select page class", None)
 
@@ -744,7 +1249,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _update_add_button_state(self) -> None:
-        self._refresh_action_signature_previews()
+        self._update_generated_methods_preview()
         has_page = self._selected_page_class() is not None
         has_locator = self._selected_candidate() is not None
         has_name = bool(self.element_name_input.text().strip())
@@ -755,15 +1260,12 @@ class MainWindow(QMainWindow):
             self._refresh_payload_status("Payload ready. Click Add to prepare output.")
 
     def _selected_actions(self) -> list[str]:
-        actions: list[str] = []
-        for action_key, _category, _label, _description, _return_hint in ACTION_PICKER_ITEMS:
-            checkbox = self.action_checkboxes.get(action_key)
-            if checkbox and checkbox.isChecked():
-                actions.append(action_key)
-        return actions
+        return list(self.selected_actions)
 
     def _on_action_selection_changed(self) -> None:
-        self._refresh_action_signature_previews()
+        self._refresh_table_root_section()
+        self._refresh_parameter_panel()
+        self._update_generated_methods_preview()
         self._refresh_payload_status()
 
     def _refresh_payload_status(self, prefix: str = "Payload preview") -> None:
@@ -775,7 +1277,7 @@ class MainWindow(QMainWindow):
             return
 
         actions = self._selected_actions()
-        action_text = ", ".join(self._action_label(action) for action in actions) if actions else "none"
+        action_text = ", ".join(action_label(action) for action in actions) if actions else "none"
         log_language = self.log_language_combo.currentText()
         self.payload_status_label.setText(
             f"{prefix}: {page.class_name} | {name} | {candidate.locator_type} | "
@@ -794,6 +1296,22 @@ class MainWindow(QMainWindow):
                 return
 
             actions = self._selected_actions()
+            action_parameters = self._collect_action_parameters()
+            if has_table_actions(actions):
+                table_root_selector = self._selected_table_root_selector()
+                if not table_root_selector:
+                    message = "Table root could not be detected. Please pick the table root container."
+                    self._set_status(message)
+                    self.payload_status_label.setText(message)
+                    self._show_toast(message)
+                    return
+            if "selectBySelectIdAuto" in actions:
+                if not action_parameters.get("selectId", "").strip():
+                    message = "Select Id is required for selectBySelectIdAuto."
+                    self._set_status(message)
+                    self.payload_status_label.setText(message)
+                    self._show_toast(message)
+                    return
             selector_details = self._resolve_java_selector(candidate)
             if not selector_details:
                 self._set_status("Selected locator type cannot be written to Java. Choose CSS/XPath/Selenium.")
@@ -802,6 +1320,7 @@ class MainWindow(QMainWindow):
                 return
 
             selector_type, selector_value = selector_details
+            selected_table_root = self._selected_table_root_selector()
             preview = generate_java_preview(
                 target_file=page.file_path,
                 locator_name=element_name,
@@ -809,6 +1328,10 @@ class MainWindow(QMainWindow):
                 selector_value=selector_value,
                 actions=actions,
                 log_language=self.log_language_combo.currentText(),
+                action_parameters=action_parameters,
+                table_root_selector_type=selected_table_root[0] if selected_table_root else None,
+                table_root_selector_value=selected_table_root[1] if selected_table_root else None,
+                table_root_locator_name=self._selected_table_root_locator_name() if selected_table_root else None,
             )
             if not preview.ok:
                 self.pending_java_preview = None
@@ -820,6 +1343,10 @@ class MainWindow(QMainWindow):
             self.pending_java_preview = preview
             self._set_status(preview.message)
             self.payload_status_label.setText(preview.message)
+            self.preview_locator_name_override = preview.final_locator_name
+            self.preview_signatures_override = list(preview.added_method_signatures)
+            self.preview_signatures_actions_snapshot = tuple(actions)
+            self._update_generated_methods_preview()
 
             preview_dialog = DiffPreviewDialog(
                 target_file=preview.target_file,
@@ -835,6 +1362,7 @@ class MainWindow(QMainWindow):
                 self._set_status("Cancelled — no changes.")
                 self.payload_status_label.setText("Cancelled — no changes.")
                 self._show_toast("Cancelled — no changes.")
+                self._update_generated_methods_preview()
                 return
 
             applied, message, _backup_path = apply_java_preview(preview)
@@ -842,6 +1370,7 @@ class MainWindow(QMainWindow):
             self._set_status(message)
             self.payload_status_label.setText(message)
             self._show_toast(message)
+            self._update_generated_methods_preview()
             return
         except Exception as exc:
             self.pending_java_preview = None
@@ -987,7 +1516,9 @@ class MainWindow(QMainWindow):
         self._copy(edited)
 
     def _on_capture(self, summary: ElementSummary, candidates: list[LocatorCandidate]) -> None:
+        self._reset_generated_preview_override()
         self.current_summary = summary
+        self._set_auto_table_root_from_summary(summary)
         scoring_failed = False
         try:
             ranked_candidates = recommend_locator_candidates(candidates)
@@ -999,6 +1530,23 @@ class MainWindow(QMainWindow):
         self.current_candidates = ranked_candidates
         self._render_summary(summary)
         self._render_candidates(self.current_candidates)
+        if self.pick_table_root_mode and self.current_candidates:
+            root_selector = self._resolve_java_selector(self.current_candidates[0])
+            if root_selector:
+                locator_name_hint = None
+                if summary.table_root:
+                    locator_name_hint = summary.table_root.get("locator_name_hint")
+                self._set_manual_table_root(
+                    selector_type=root_selector[0],
+                    selector_value=root_selector[1],
+                    locator_name=locator_name_hint or "TABLE_ROOT_TABLE",
+                )
+                self._set_status("Table root overridden from picked element.")
+                self._show_toast("Table root overridden")
+            else:
+                self._set_status("Picked element locator type is unsupported for table root.")
+                self._show_toast("Unsupported table root locator")
+            self.pick_table_root_mode = False
         if self.current_candidates:
             self._suggest_element_name(self.current_candidates[0], force=True)
         else:
@@ -1141,6 +1689,8 @@ class MainWindow(QMainWindow):
         if candidate:
             self._show_breakdown(candidate)
             self.locator_editor.setPlainText(candidate.locator)
+        self._reset_generated_preview_override()
+        self._refresh_parameter_panel()
         self._update_add_button_state()
 
     def _show_breakdown(self, candidate: LocatorCandidate) -> None:

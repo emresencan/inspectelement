@@ -19,6 +19,8 @@ class ElementSummary:
     aria_label: str | None
     label_text: str | None
     attributes: dict[str, str] = field(default_factory=dict)
+    ancestry: list[dict[str, str]] = field(default_factory=list)
+    table_root: dict[str, str] | None = None
 
     def signature(self) -> str:
         keys = ("id", "name", "data-testid", "data-test", "data-qa", "aria-label", "type")

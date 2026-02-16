@@ -392,3 +392,172 @@ def test_build_action_method_signature_preview() -> None:
         )
         == "public String getEvYasamTxtAttribute(String attribute)"
     )
+
+
+def test_table_required_actions_generate_expected_calls_and_imports() -> None:
+    source = """package com.turkcell.pages;
+
+public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+    result = prepare_java_patch(
+        source=source,
+        locator_name="ROW_CELL_TXT",
+        selector_type="css",
+        selector_value="td.cell",
+        actions=("tableAssertRowExists", "tableHasAnyRow", "tableAssertHasAnyRow", "tableFilter"),
+        table_root_selector_type="id",
+        table_root_selector_value="ordersGrid",
+        table_root_locator_name="ORDERS_TABLE",
+    )
+    assert result.ok
+    assert result.changed
+    assert "import java.time.Duration;" in result.updated_source
+    assert "import com.turkcell.common.components.table.HtmlTableVerifier;" in result.updated_source
+    assert "private final By ORDERS_TABLE = By.id(\"ordersGrid\");" in result.updated_source
+    assert "public FolderPage assertOrdersTableRowExists(String columnHeader, String expectedText, int timeoutSec)" in result.updated_source
+    assert ".whereEquals(columnHeader, expectedText)" in result.updated_source
+    assert "public boolean hasOrdersTableAnyRow(int timeoutSec)" in result.updated_source
+    assert ".hasAnyRow();" in result.updated_source
+    assert "public FolderPage assertOrdersTableHasAnyRow(int timeoutSec)" in result.updated_source
+    assert ".assertHasAnyRow();" in result.updated_source
+    assert "public FolderPage filterOrdersTable(String columnHeader, String filterText, int timeoutSec)" in result.updated_source
+    assert ".filter(columnHeader, filterText);" in result.updated_source
+
+
+def test_select_action_generation_uses_universal_select_helper() -> None:
+    source = """package com.turkcell.pages;
+
+public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+    result = prepare_java_patch(
+        source=source,
+        locator_name="CITY_SELECT",
+        selector_type="id",
+        selector_value="citySelect",
+        actions=("selectBySelectIdAuto", "selectByLabel"),
+        action_parameters={"waitBeforeSelect": "true", "selectId": "citySelect"},
+    )
+    assert result.ok
+    assert result.changed
+    assert "import com.turkcell.common.components.selectHelper.UniversalSelectHelper;" in result.updated_source
+    assert "public FolderPage selectCitySelect(String optionText)" in result.updated_source
+    assert ".withWaitBeforeSelect(true)" in result.updated_source
+    assert '.selectBySelectIdAuto("citySelect", optionText);' in result.updated_source
+    assert "public FolderPage selectCitySelectByLabel(String labelText, String optionText)" in result.updated_source
+    assert ".selectByLabel(labelText, optionText);" in result.updated_source
+
+
+def test_select_by_select_id_auto_requires_select_id_when_not_id_selector() -> None:
+    source = """public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+    result = prepare_java_patch(
+        source=source,
+        locator_name="CITY_SELECT",
+        selector_type="css",
+        selector_value="div.city-select",
+        actions=("selectBySelectIdAuto",),
+        action_parameters={"waitBeforeSelect": "false"},
+    )
+    assert not result.ok
+    assert result.message == "Select Id is required for selectBySelectIdAuto."
+
+
+def test_signature_preview_uses_table_locator_name_for_table_actions() -> None:
+    signature = build_action_method_signature_preview(
+        page_class_name="FolderPage",
+        locator_name="EV_YASAM_TXT",
+        action="tableHasAnyRow",
+        table_locator_name="ORDERS_TABLE",
+    )
+    assert signature == "public boolean hasOrdersTableAnyRow(int timeoutSec)"
+
+
+def test_table_actions_support_contains_chain_and_radio_click() -> None:
+    source = """public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+    result = prepare_java_patch(
+        source=source,
+        locator_name="ROW_CELL_TXT",
+        selector_type="css",
+        selector_value="td.cell",
+        actions=("tableAssertRowExists", "tableClickRadioInRow"),
+        table_root_selector_type="id",
+        table_root_selector_value="ordersGrid",
+        table_root_locator_name="ORDERS_TABLE",
+        action_parameters={"matchType": "contains"},
+    )
+    assert result.ok
+    assert result.changed
+    assert (
+        "public FolderPage clickOrdersTableRadioInRow(String matchColumnHeader, String matchText, int timeoutSec)"
+        in result.updated_source
+    )
+    assert ".whereContains(columnHeader, expectedText)" in result.updated_source
+    assert ".whereContains(matchColumnHeader, matchText)" in result.updated_source
+    assert ".assertRowExists()" in result.updated_source
+    assert ".clickRadioInRow();" in result.updated_source
+
+
+def test_table_predicate_and_all_equals_actions_generate_expected_signatures() -> None:
+    source = """package com.turkcell.pages;
+
+public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+    result = prepare_java_patch(
+        source=source,
+        locator_name="ROW_CELL_TXT",
+        selector_type="css",
+        selector_value="td.cell",
+        actions=("tableAssertRowMatches", "tableAssertRowAllEquals"),
+        table_root_selector_type="id",
+        table_root_selector_value="ordersGrid",
+        table_root_locator_name="ORDERS_TABLE",
+    )
+    assert result.ok
+    assert result.changed
+    assert "import java.util.Map;" in result.updated_source
+    assert "import java.util.function.Predicate;" in result.updated_source
+    assert (
+        "public FolderPage assertOrdersTableRowMatches(String columnHeader, Predicate<String> predicate, int timeoutSec)"
+        in result.updated_source
+    )
+    assert ".whereMatches(columnHeader, predicate)" in result.updated_source
+    assert (
+        "public FolderPage assertOrdersTableRowAllEquals(Map<String, String> columnToExpectedText, int timeoutSec)"
+        in result.updated_source
+    )
+    assert ".whereAllEquals(columnToExpectedText)" in result.updated_source
+    assert result.added_method_signatures == (
+        "public FolderPage assertOrdersTableRowMatches(String columnHeader, Predicate<String> predicate, int timeoutSec)",
+        "public FolderPage assertOrdersTableRowAllEquals(Map<String, String> columnToExpectedText, int timeoutSec)",
+    )

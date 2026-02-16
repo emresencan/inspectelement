@@ -20,7 +20,57 @@ SUPPORTED_ACTIONS: tuple[str, ...] = (
     "javaScriptClearAndSetValue",
     "javaScriptGetInnerText",
     "javaScriptGetValue",
+    "tableAssertRowExists",
+    "tableHasAnyRow",
+    "tableAssertHasAnyRow",
+    "tableFilter",
+    "tableAssertRowMatches",
+    "tableAssertRowAllEquals",
+    "tableClickInColumn",
+    "tableClickInRow",
+    "tableClickButtonInRow",
+    "tableSetInputInColumn",
+    "tableAssertColumnTextEquals",
+    "tableGetColumnText",
+    "tableClickInFirstRow",
+    "tableClickRadioInRow",
+    "tableClickLink",
+    "selectBySelectIdAuto",
+    "selectByLabel",
 )
+
+TABLE_ACTIONS: set[str] = {
+    "tableAssertRowExists",
+    "tableHasAnyRow",
+    "tableAssertHasAnyRow",
+    "tableFilter",
+    "tableAssertRowMatches",
+    "tableAssertRowAllEquals",
+    "tableClickInColumn",
+    "tableClickInRow",
+    "tableClickButtonInRow",
+    "tableSetInputInColumn",
+    "tableAssertColumnTextEquals",
+    "tableGetColumnText",
+    "tableClickInFirstRow",
+    "tableClickRadioInRow",
+    "tableClickLink",
+}
+
+SELECT_ACTIONS: set[str] = {"selectBySelectIdAuto", "selectByLabel"}
+
+ELEMENT_LOCATOR_ACTIONS: set[str] = {
+    "clickElement",
+    "javaScriptClicker",
+    "getText",
+    "getAttribute",
+    "isElementDisplayed",
+    "isElementEnabled",
+    "scrollToElement",
+    "javaScriptClearAndSetValue",
+    "javaScriptGetInnerText",
+    "javaScriptGetValue",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,8 +106,13 @@ def prepare_java_patch(
     selector_value: str,
     actions: Sequence[str],
     log_language: str = "TR",
+    action_parameters: dict[str, str] | None = None,
+    table_root_selector_type: str | None = None,
+    table_root_selector_value: str | None = None,
+    table_root_locator_name: str | None = None,
 ) -> JavaPatchResult:
     normalized_log_language = _normalize_log_language(log_language)
+    parameters = {str(key): str(value) for key, value in (action_parameters or {}).items()}
     notes: list[str] = []
     class_span = _find_primary_class_span(source)
     if class_span is None:
@@ -75,38 +130,110 @@ def prepare_java_patch(
     class_name, open_brace_index, close_brace_index = class_span
     class_inner = source[open_brace_index + 1 : close_brace_index]
     class_inner = _ensure_regions(class_inner, class_name)
-
-    by_expression = _selector_to_by_expression(selector_type, selector_value)
-    if by_expression is None:
-        return JavaPatchResult(
-            ok=False,
-            changed=False,
-            message="Selected locator type is not supported for Java write.",
-            updated_source=source,
-            final_locator_name=None,
-            added_methods=(),
-            added_method_signatures=(),
-            notes=(),
-        )
-
     updated_source = source[: open_brace_index + 1] + class_inner + source[close_brace_index:]
 
+    actions_normalized = _normalize_actions(actions)
     requested_locator_name = locator_name.strip().upper() or "ELEMENT"
-    existing_constant = _find_existing_locator_constant(updated_source, by_expression)
-    locator_constant = existing_constant
-    if existing_constant:
-        notes.append(f"Selector already exists as {existing_constant}; reusing.")
-    else:
-        locator_constant = _resolve_unique_locator_name(updated_source, requested_locator_name)
-        if locator_constant != requested_locator_name:
-            notes.append(f"Name exists; using {locator_constant}")
-        locator_line = f"private final By {locator_constant} = {by_expression};"
-        updated_source = _insert_region_entry(updated_source, "AUTO_LOCATORS", locator_line)
-        if updated_source is None:
+
+    locator_constant = requested_locator_name
+    requires_element_locator = not actions_normalized or any(action in ELEMENT_LOCATOR_ACTIONS for action in actions_normalized)
+    if requires_element_locator:
+        by_expression = _selector_to_by_expression(selector_type, selector_value)
+        if by_expression is None:
             return JavaPatchResult(
                 ok=False,
                 changed=False,
-                message=SAFE_PARSE_ERROR,
+                message="Selected locator type is not supported for Java write.",
+                updated_source=source,
+                final_locator_name=None,
+                added_methods=(),
+                added_method_signatures=(),
+                notes=(),
+            )
+
+        existing_constant = _find_existing_locator_constant(updated_source, by_expression)
+        locator_constant = existing_constant or requested_locator_name
+        if existing_constant:
+            notes.append(f"Selector already exists as {existing_constant}; reusing.")
+        else:
+            locator_constant = _resolve_unique_locator_name(updated_source, requested_locator_name)
+            if locator_constant != requested_locator_name:
+                notes.append(f"Name exists; using {locator_constant}")
+            locator_line = f"private final By {locator_constant} = {by_expression};"
+            updated_source = _insert_region_entry(updated_source, "AUTO_LOCATORS", locator_line)
+            if updated_source is None:
+                return JavaPatchResult(
+                    ok=False,
+                    changed=False,
+                    message=SAFE_PARSE_ERROR,
+                    updated_source=source,
+                    final_locator_name=None,
+                    added_methods=(),
+                    added_method_signatures=(),
+                    notes=(),
+                )
+
+    table_locator_constant: str | None = None
+    if any(action in TABLE_ACTIONS for action in actions_normalized):
+        if not table_root_selector_type or not table_root_selector_value:
+            return JavaPatchResult(
+                ok=False,
+                changed=False,
+                message="Table root could not be detected. Please pick the table root container.",
+                updated_source=source,
+                final_locator_name=None,
+                added_methods=(),
+                added_method_signatures=(),
+                notes=(),
+            )
+
+        table_by_expression = _selector_to_by_expression(table_root_selector_type, table_root_selector_value)
+        if table_by_expression is None:
+            return JavaPatchResult(
+                ok=False,
+                changed=False,
+                message="Table root locator type is not supported for Java write.",
+                updated_source=source,
+                final_locator_name=None,
+                added_methods=(),
+                added_method_signatures=(),
+                notes=(),
+            )
+
+        requested_table_name = (table_root_locator_name or f"{requested_locator_name}_TABLE").strip().upper() or "TABLE"
+        if not requested_table_name.endswith("_TABLE"):
+            requested_table_name = f"{requested_table_name}_TABLE"
+        existing_table_constant = _find_existing_locator_constant(updated_source, table_by_expression)
+        table_locator_constant = existing_table_constant or requested_table_name
+        if existing_table_constant:
+            notes.append(f"Table selector already exists as {existing_table_constant}; reusing.")
+        else:
+            table_locator_constant = _resolve_unique_locator_name(updated_source, requested_table_name)
+            if table_locator_constant != requested_table_name:
+                notes.append(f"Table name exists; using {table_locator_constant}")
+            table_locator_line = f"private final By {table_locator_constant} = {table_by_expression};"
+            updated_source = _insert_region_entry(updated_source, "AUTO_LOCATORS", table_locator_line)
+            if updated_source is None:
+                return JavaPatchResult(
+                    ok=False,
+                    changed=False,
+                    message=SAFE_PARSE_ERROR,
+                    updated_source=source,
+                    final_locator_name=None,
+                    added_methods=(),
+                    added_method_signatures=(),
+                    notes=(),
+                )
+
+    if "selectBySelectIdAuto" in actions_normalized:
+        select_id = parameters.get("selectId", "").strip()
+        if not select_id and selector_type.strip().lower() == "id":
+            parameters["selectId"] = selector_value
+        elif not select_id:
+            return JavaPatchResult(
+                ok=False,
+                changed=False,
+                message="Select Id is required for selectBySelectIdAuto.",
                 updated_source=source,
                 final_locator_name=None,
                 added_methods=(),
@@ -116,16 +243,18 @@ def prepare_java_patch(
 
     added_methods: list[str] = []
     added_method_signatures: list[str] = []
-    actions_normalized = _normalize_actions(actions)
     for action in actions_normalized:
-        method_name = _resolve_unique_method_name(updated_source, _method_base_name(action, locator_constant))
+        method_base_locator = table_locator_constant if action in TABLE_ACTIONS else locator_constant
+        method_name = _resolve_unique_method_name(updated_source, _method_base_name(action, method_base_locator))
         method_signature = _build_method_signature(page_class_name=class_name, action=action, method_name=method_name)
         method_body = _build_method_snippet(
-            class_name,
-            action,
-            method_name,
-            locator_constant,
-            normalized_log_language,
+            page_class_name=class_name,
+            action=action,
+            method_name=method_name,
+            locator_constant=locator_constant,
+            table_locator_constant=table_locator_constant,
+            log_language=normalized_log_language,
+            action_parameters=parameters,
         )
         patched = _insert_region_entry(updated_source, "AUTO_ACTIONS", method_body)
         if patched is None:
@@ -143,6 +272,9 @@ def prepare_java_patch(
         added_methods.append(method_name)
         added_method_signatures.append(method_signature)
 
+    required_imports = _required_imports_for_actions(actions_normalized)
+    updated_source = _ensure_required_imports(updated_source, required_imports)
+
     if updated_source == source:
         if notes:
             message = " ".join(notes)
@@ -153,7 +285,7 @@ def prepare_java_patch(
             changed=False,
             message=message,
             updated_source=source,
-            final_locator_name=locator_constant,
+            final_locator_name=table_locator_constant or locator_constant,
             added_methods=tuple(added_methods),
             added_method_signatures=tuple(added_method_signatures),
             notes=tuple(notes),
@@ -168,7 +300,7 @@ def prepare_java_patch(
         changed=True,
         message=message,
         updated_source=updated_source,
-        final_locator_name=locator_constant,
+        final_locator_name=table_locator_constant or locator_constant,
         added_methods=tuple(added_methods),
         added_method_signatures=tuple(added_method_signatures),
         notes=tuple(notes),
@@ -182,6 +314,10 @@ def generate_java_preview(
     selector_value: str,
     actions: Sequence[str],
     log_language: str = "TR",
+    action_parameters: dict[str, str] | None = None,
+    table_root_selector_type: str | None = None,
+    table_root_selector_value: str | None = None,
+    table_root_locator_name: str | None = None,
 ) -> JavaPreview:
     try:
         original_source = target_file.read_text(encoding="utf-8")
@@ -206,6 +342,10 @@ def generate_java_preview(
         selector_value=selector_value,
         actions=actions,
         log_language=log_language,
+        action_parameters=action_parameters,
+        table_root_selector_type=table_root_selector_type,
+        table_root_selector_value=table_root_selector_value,
+        table_root_locator_name=table_root_locator_name,
     )
 
     if not patch.ok:
@@ -475,11 +615,70 @@ def _normalize_expression(value: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
-def build_action_method_signature_preview(page_class_name: str, locator_name: str, action: str) -> str | None:
+def _required_imports_for_actions(actions: Sequence[str]) -> list[str]:
+    imports: list[str] = []
+    if any(action in TABLE_ACTIONS for action in actions):
+        imports.extend(
+            [
+                "java.time.Duration",
+                "com.turkcell.common.components.table.HtmlTableVerifier",
+            ]
+        )
+    if "tableAssertRowMatches" in actions:
+        imports.append("java.util.function.Predicate")
+    if "tableAssertRowAllEquals" in actions:
+        imports.append("java.util.Map")
+    if any(action in SELECT_ACTIONS for action in actions):
+        imports.append("com.turkcell.common.components.selectHelper.UniversalSelectHelper")
+    return imports
+
+
+def _ensure_required_imports(source: str, required_imports: Sequence[str]) -> str:
+    if not required_imports:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    existing_imports: set[str] = set()
+    last_import_index = -1
+    package_index = -1
+
+    import_pattern = re.compile(r"^\s*import\s+([A-Za-z0-9_.*]+)\s*;\s*$")
+    package_pattern = re.compile(r"^\s*package\s+[A-Za-z0-9_.]+\s*;\s*$")
+
+    for index, line in enumerate(lines):
+        import_match = import_pattern.match(line)
+        if import_match:
+            existing_imports.add(import_match.group(1))
+            last_import_index = index
+            continue
+        if package_pattern.match(line):
+            package_index = index
+
+    missing = [item for item in required_imports if item not in existing_imports]
+    if not missing:
+        return source
+
+    insertion_index = last_import_index + 1 if last_import_index >= 0 else package_index + 1
+    insert_lines = [f"import {item};\n" for item in missing]
+    if insertion_index > 0 and (insertion_index >= len(lines) or lines[insertion_index - 1].strip()):
+        insert_lines.insert(0, "\n")
+    lines[insertion_index:insertion_index] = insert_lines
+    return "".join(lines)
+
+
+def build_action_method_signature_preview(
+    page_class_name: str,
+    locator_name: str,
+    action: str,
+    *,
+    table_locator_name: str | None = None,
+    action_parameters: dict[str, str] | None = None,
+) -> str | None:
     normalized_action = _normalize_action_key(action)
     if normalized_action is None:
         return None
-    base_name = _method_base_name(normalized_action, locator_name.strip().upper() or "ELEMENT")
+    base_name_source = table_locator_name if normalized_action in TABLE_ACTIONS else locator_name
+    base_name = _method_base_name(normalized_action, (base_name_source or "ELEMENT").strip().upper() or "ELEMENT")
     return _build_method_signature(page_class_name=page_class_name, action=normalized_action, method_name=base_name)
 
 
@@ -504,6 +703,18 @@ def _normalize_action_key(action: str) -> str | None:
     return None
 
 
+def _table_where_method(action_parameters: dict[str, str]) -> str:
+    match_type = action_parameters.get("matchType", "equals").strip().lower()
+    return "whereContains" if match_type == "contains" else "whereEquals"
+
+
+def _to_boolean_literal(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return "true"
+    return "false"
+
+
 def _method_base_name(action: str, locator_name: str) -> str:
     pascal_name = _to_pascal_case(locator_name)
     if action == "clickElement":
@@ -526,6 +737,40 @@ def _method_base_name(action: str, locator_name: str) -> str:
         return f"jsGet{pascal_name}InnerText"
     if action == "javaScriptGetValue":
         return f"jsGet{pascal_name}Value"
+    if action == "tableAssertRowExists":
+        return f"assert{pascal_name}RowExists"
+    if action == "tableHasAnyRow":
+        return f"has{pascal_name}AnyRow"
+    if action == "tableAssertHasAnyRow":
+        return f"assert{pascal_name}HasAnyRow"
+    if action == "tableFilter":
+        return f"filter{pascal_name}"
+    if action == "tableAssertRowMatches":
+        return f"assert{pascal_name}RowMatches"
+    if action == "tableAssertRowAllEquals":
+        return f"assert{pascal_name}RowAllEquals"
+    if action == "tableClickInColumn":
+        return f"click{pascal_name}InColumn"
+    if action == "tableClickInRow":
+        return f"click{pascal_name}InRow"
+    if action == "tableClickButtonInRow":
+        return f"click{pascal_name}ButtonInRow"
+    if action == "tableSetInputInColumn":
+        return f"set{pascal_name}InputInColumn"
+    if action == "tableAssertColumnTextEquals":
+        return f"assert{pascal_name}ColumnTextEquals"
+    if action == "tableGetColumnText":
+        return f"get{pascal_name}ColumnText"
+    if action == "tableClickInFirstRow":
+        return f"click{pascal_name}FirstRow"
+    if action == "tableClickRadioInRow":
+        return f"click{pascal_name}RadioInRow"
+    if action == "tableClickLink":
+        return f"click{pascal_name}Link"
+    if action == "selectBySelectIdAuto":
+        return f"select{pascal_name}"
+    if action == "selectByLabel":
+        return f"select{pascal_name}ByLabel"
     return f"action{pascal_name}"
 
 
@@ -542,6 +787,59 @@ def _build_method_signature(page_class_name: str, action: str, method_name: str)
         return f"public String {method_name}()"
     if action in {"isElementDisplayed", "isElementEnabled"}:
         return f"public boolean {method_name}(int timeoutSeconds)"
+    if action == "tableAssertRowExists":
+        return f"public {page_class_name} {method_name}(String columnHeader, String expectedText, int timeoutSec)"
+    if action == "tableHasAnyRow":
+        return f"public boolean {method_name}(int timeoutSec)"
+    if action == "tableAssertHasAnyRow":
+        return f"public {page_class_name} {method_name}(int timeoutSec)"
+    if action == "tableFilter":
+        return f"public {page_class_name} {method_name}(String columnHeader, String filterText, int timeoutSec)"
+    if action == "tableAssertRowMatches":
+        return (
+            f"public {page_class_name} {method_name}("
+            "String columnHeader, Predicate<String> predicate, int timeoutSec)"
+        )
+    if action == "tableAssertRowAllEquals":
+        return f"public {page_class_name} {method_name}(Map<String, String> columnToExpectedText, int timeoutSec)"
+    if action == "tableClickInColumn":
+        return (
+            f"public {page_class_name} {method_name}("
+            "String matchColumnHeader, String matchText, String columnHeader, By innerLocator, int timeoutSec)"
+        )
+    if action in {"tableClickInRow", "tableClickButtonInRow"}:
+        return (
+            f"public {page_class_name} {method_name}("
+            "String matchColumnHeader, String matchText, By innerLocator, int timeoutSec)"
+        )
+    if action == "tableSetInputInColumn":
+        return (
+            f"public {page_class_name} {method_name}("
+            "String matchColumnHeader, String matchText, String columnHeader, String text, int timeoutSec)"
+        )
+    if action == "tableAssertColumnTextEquals":
+        return (
+            f"public {page_class_name} {method_name}("
+            "String matchColumnHeader, String matchText, String columnHeader, String expectedText, int timeoutSec)"
+        )
+    if action == "tableGetColumnText":
+        return (
+            f"public String {method_name}("
+            "String matchColumnHeader, String matchText, String columnHeader, int timeoutSec)"
+        )
+    if action == "tableClickInFirstRow":
+        return f"public {page_class_name} {method_name}(By innerLocator, int timeoutSec)"
+    if action == "tableClickRadioInRow":
+        return (
+            f"public {page_class_name} {method_name}("
+            "String matchColumnHeader, String matchText, int timeoutSec)"
+        )
+    if action == "tableClickLink":
+        return f"public {page_class_name} {method_name}(String matchColumnHeader, String matchText, int timeoutSec)"
+    if action == "selectBySelectIdAuto":
+        return f"public {page_class_name} {method_name}(String optionText)"
+    if action == "selectByLabel":
+        return f"public {page_class_name} {method_name}(String labelText, String optionText)"
     return f"public {page_class_name} {method_name}()"
 
 
@@ -553,15 +851,21 @@ def _to_pascal_case(value: str) -> str:
 
 
 def _build_method_snippet(
+    *,
     page_class_name: str,
     action: str,
     method_name: str,
     locator_constant: str,
+    table_locator_constant: str | None,
     log_language: str,
+    action_parameters: dict[str, str],
 ) -> str:
     label = _locator_human_label(locator_constant)
     label_java = _escape_java_string(label)
     signature = _build_method_signature(page_class_name, action, method_name)
+    table_constant = table_locator_constant or "TABLE_LOCATOR"
+    table_label = _locator_human_label(table_constant)
+    table_label_java = _escape_java_string(table_label)
 
     if action == "clickElement":
         description = f"{label} alanına tıklanır." if log_language == "TR" else f"Clicks {label} element."
@@ -747,6 +1051,315 @@ def _build_method_snippet(
             "}"
         )
 
+    if action == "tableAssertRowExists":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Asserts row exists in {table_label} table.\n"
+            " *\n"
+            " * @param columnHeader table column header\n"
+            " * @param expectedText expected cell text\n"
+            " * @param timeoutSec timeout seconds\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(columnHeader, expectedText)\n"
+            "        .assertRowExists();\n"
+            '    logPass("Table row exists: " + columnHeader + "=" + expectedText);\n'
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableHasAnyRow":
+        return (
+            "/**\n"
+            f" * Checks whether {table_label} table has any data row.\n"
+            " *\n"
+            " * @param timeoutSec timeout seconds\n"
+            " * @return true if any row exists\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    boolean hasAny = new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            "        .hasAnyRow();\n"
+            "    return hasAny;\n"
+            "}"
+        )
+
+    if action == "tableAssertHasAnyRow":
+        return (
+            "/**\n"
+            f" * Asserts {table_label} table has at least one row.\n"
+            " *\n"
+            " * @param timeoutSec timeout seconds\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            "        .assertHasAnyRow();\n"
+            f'    logPass("{table_label_java} tablosunda en az bir satır doğrulandı.");\n'
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableFilter":
+        return (
+            "/**\n"
+            f" * Applies table filter in {table_label}.\n"
+            " *\n"
+            " * @param columnHeader table column header\n"
+            " * @param filterText filter value\n"
+            " * @param timeoutSec timeout seconds\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            "        .filter(columnHeader, filterText);\n"
+            '    logPass("Table filter applied: " + columnHeader + "=" + filterText);\n'
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableAssertRowMatches":
+        return (
+            "/**\n"
+            f" * Asserts row exists in {table_label} using custom predicate.\n"
+            " *\n"
+            " * @param columnHeader table column header\n"
+            " * @param predicate custom match predicate\n"
+            " * @param timeoutSec timeout seconds\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            "        .whereMatches(columnHeader, predicate)\n"
+            "        .assertRowExists();\n"
+            '    logPass("Table row matches predicate for: " + columnHeader);\n'
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableAssertRowAllEquals":
+        return (
+            "/**\n"
+            f" * Asserts row exists in {table_label} using all column/value criteria.\n"
+            " *\n"
+            " * @param columnToExpectedText column to expected text map\n"
+            " * @param timeoutSec timeout seconds\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            "        .whereAllEquals(columnToExpectedText)\n"
+            "        .assertRowExists();\n"
+            '    logPass("Table row exists for all expected column values.");\n'
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableClickInColumn":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Clicks inner locator in target column for matched row in {table_label}.\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(matchColumnHeader, matchText)\n"
+            "        .assertRowExists()\n"
+            "        .clickInColumn(columnHeader, innerLocator);\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableClickInRow":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Clicks inner locator in matched row for {table_label}.\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(matchColumnHeader, matchText)\n"
+            "        .assertRowExists()\n"
+            "        .clickInRow(innerLocator);\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableClickButtonInRow":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Clicks button locator in matched row for {table_label}.\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(matchColumnHeader, matchText)\n"
+            "        .assertRowExists()\n"
+            "        .clickButtonInRow(innerLocator);\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableSetInputInColumn":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Sets input text in matched row/column for {table_label}.\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(matchColumnHeader, matchText)\n"
+            "        .assertRowExists()\n"
+            "        .setInputInColumn(columnHeader, text);\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableAssertColumnTextEquals":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Asserts column text equals expected value in {table_label}.\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(matchColumnHeader, matchText)\n"
+            "        .assertRowExists()\n"
+            "        .assertColumnTextEquals(columnHeader, expectedText);\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableGetColumnText":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Returns matched row column text from {table_label}.\n"
+            " *\n"
+            " * @return column text\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    String value = new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(matchColumnHeader, matchText)\n"
+            "        .assertRowExists()\n"
+            "        .getColumnText(columnHeader);\n"
+            "    return value;\n"
+            "}"
+        )
+
+    if action == "tableClickInFirstRow":
+        return (
+            "/**\n"
+            f" * Clicks inner locator in first row of {table_label}.\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            "        .clickInFirstRow(innerLocator);\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableClickRadioInRow":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Clicks radio input in matched row for {table_label}.\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(matchColumnHeader, matchText)\n"
+            "        .assertRowExists()\n"
+            "        .clickRadioInRow();\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "tableClickLink":
+        where_method = _table_where_method(action_parameters)
+        return (
+            "/**\n"
+            f" * Clicks first link in matched row for {table_label}.\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new HtmlTableVerifier(driver, Duration.ofSeconds(timeoutSec))\n"
+            f"        .inTable({table_constant})\n"
+            f"        .{where_method}(matchColumnHeader, matchText)\n"
+            "        .assertRowExists()\n"
+            "        .clickLink();\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "selectBySelectIdAuto":
+        wait_before_select = _to_boolean_literal(action_parameters.get("waitBeforeSelect", "false"))
+        select_id = _escape_java_string(action_parameters.get("selectId", ""))
+        return (
+            "/**\n"
+            f" * Selects option for {label} via UniversalSelectHelper.selectBySelectIdAuto.\n"
+            " *\n"
+            " * @param optionText option text to select\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new UniversalSelectHelper(driver)\n"
+            f"        .withWaitBeforeSelect({wait_before_select})\n"
+            f"        .selectBySelectIdAuto(\"{select_id}\", optionText);\n"
+            f'    logPass("Select yapıldı: {label_java} -> " + optionText);\n'
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "selectByLabel":
+        wait_before_select = _to_boolean_literal(action_parameters.get("waitBeforeSelect", "false"))
+        return (
+            "/**\n"
+            f" * Selects option by label for {label}.\n"
+            " *\n"
+            " * @param labelText select label text\n"
+            " * @param optionText option text to select\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            "    new UniversalSelectHelper(driver)\n"
+            f"        .withWaitBeforeSelect({wait_before_select})\n"
+            "        .selectByLabel(labelText, optionText);\n"
+            f'    logPass("Select by label yapıldı: " + labelText + " -> " + optionText);\n'
+            "    return this;\n"
+            "}"
+        )
+
     return (
         "/**\n"
         f" * No template found for action: {action}\n"
@@ -765,7 +1378,7 @@ def _normalize_log_language(value: str) -> str:
 
 
 def _locator_human_label(locator_constant: str) -> str:
-    no_suffix = re.sub(r"_(TXT|BTN|LNK)$", "", locator_constant.strip(), flags=re.IGNORECASE)
+    no_suffix = re.sub(r"_(TXT|BTN|LNK|TABLE)$", "", locator_constant.strip(), flags=re.IGNORECASE)
     compact = re.sub(r"_+", "_", no_suffix).strip("_")
     if not compact:
         return "ELEMENT"

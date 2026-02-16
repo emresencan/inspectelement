@@ -4,6 +4,7 @@ from playwright.sync_api import ElementHandle
 
 from .locator_generator import normalize_classes
 from .models import ElementSummary
+from .table_root_detection import detect_table_root_from_ancestry
 
 
 def extract_element_summary(element: ElementHandle) -> ElementSummary:
@@ -35,6 +36,27 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
           const labels = el.labels ? Array.from(el.labels) : [];
           const labelText = labels.length ? (labels[0].innerText || labels[0].textContent || '').trim().replace(/\s+/g, ' ') : null;
 
+          const ancestry = [];
+          let current = el;
+          while (current && current.nodeType === Node.ELEMENT_NODE && ancestry.length < 14) {
+            let nth = 1;
+            let sibling = current;
+            while ((sibling = sibling.previousElementSibling)) {
+              if (sibling.tagName === current.tagName) nth += 1;
+            }
+            ancestry.push({
+              tag: (current.tagName || '').toLowerCase(),
+              id: current.id || '',
+              role: current.getAttribute('role') || '',
+              class: current.className || '',
+              nth: String(nth),
+              'data-testid': current.getAttribute('data-testid') || '',
+              'data-test': current.getAttribute('data-test') || '',
+              'data-qa': current.getAttribute('data-qa') || '',
+            });
+            current = current.parentElement;
+          }
+
           return {
             tag,
             id: el.id || null,
@@ -46,10 +68,27 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
             aria_label: el.getAttribute('aria-label') || null,
             label_text: labelText || null,
             attributes: attrs,
+            ancestry,
           };
         }
         """
     )
+
+    ancestry = [
+        {str(key): str(value) for key, value in item.items() if value is not None}
+        for item in payload.get("ancestry", [])
+        if isinstance(item, dict)
+    ]
+    table_root_candidate = detect_table_root_from_ancestry(ancestry)
+    table_root = None
+    if table_root_candidate:
+        table_root = {
+            "selector_type": table_root_candidate.selector_type,
+            "selector_value": table_root_candidate.selector_value,
+            "reason": table_root_candidate.reason,
+            "tag": table_root_candidate.tag,
+            "locator_name_hint": table_root_candidate.locator_name_hint,
+        }
 
     return ElementSummary(
         tag=payload.get("tag", "unknown"),
@@ -62,4 +101,6 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
         aria_label=payload.get("aria_label"),
         label_text=payload.get("label_text"),
         attributes={str(k): str(v) for k, v in payload.get("attributes", {}).items()},
+        ancestry=ancestry,
+        table_root=table_root,
     )
