@@ -100,3 +100,16 @@ def compute_workspace_button_state(
         can_apply=can_apply,
         can_cancel_preview=can_cancel_preview,
     )
+
+
+def can_enable_new_page_button(
+    *,
+    has_project_root: bool,
+    has_module: bool,
+    has_pages_source_root: bool,
+) -> bool:
+    return has_project_root and has_module and has_pages_source_root
+
+
+def can_enable_inspect_toggle(*, has_launched_page: bool, has_embedded_browser: bool) -> bool:
+    return has_launched_page and has_embedded_browser

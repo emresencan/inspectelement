@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
 from pathlib import Path
 import re
 import sys
+from typing import Any
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QPoint, QRect, QSize, QTimer, Qt, Signal, QUrl
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication, QIcon
+from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -35,7 +38,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .browser_manager import BrowserManager
 from .action_catalog import (
     ACTION_PRESETS,
     CATEGORY_FILTERS,
@@ -49,32 +51,49 @@ from .action_catalog import (
     required_parameter_keys,
     return_kind_badge,
 )
+from .embedded_inspector import (
+    EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT,
+    build_element_summary_from_payload,
+    build_locator_candidates_from_payload,
+)
 from .java_pom_writer import (
     JavaPreview,
     apply_java_preview,
     generate_java_preview,
 )
+from .learning_store import LearningStore
 from .locator_recommendation import recommend_locator_candidates
-from .models import ElementSummary, LocatorCandidate
+from .models import ElementSummary, LocatorCandidate, PageContext
 from .name_suggester import suggest_element_name
+from .override_logic import build_override_candidate, inject_override_candidate
 from .page_creator import (
     PageCreationPreview,
     apply_page_creation_preview,
     generate_page_creation_preview,
 )
 from .project_discovery import ModuleInfo, PageClassInfo, discover_module, discover_modules, discover_page_classes
+from .selector_rules import is_obvious_root_container_locator
 from .ui_state import (
     WorkspaceState,
+    can_enable_inspect_toggle,
+    can_enable_new_page_button,
     compute_workspace_button_state,
     load_workspace_state,
     save_workspace_state,
 )
 from .validation import validate_generation_request
 
-class EventBridge(QObject):
-    capture_received = Signal(object, object)
-    status_changed = Signal(str)
-    page_changed = Signal(str, str)
+class EmbeddedInspectBridge(QObject):
+    payload_received = Signal(object)
+    log_received = Signal(str)
+
+    @Slot("QVariant")
+    def report(self, payload: Any) -> None:
+        self.payload_received.emit(payload)
+
+    @Slot(str)
+    def log(self, message: str) -> None:
+        self.log_received.emit(str(message))
 
 
 class FlowLayout(QLayout):
@@ -251,6 +270,8 @@ class BrowserPanel(QFrame):
         self.setObjectName("BrowserPanel")
 
         self._web_view = None
+        self._current_title = ""
+        self._current_url = ""
         self._fallback_label = QLabel("")
         self._fallback_label.setObjectName("Muted")
         self._fallback_label.setWordWrap(True)
@@ -283,16 +304,35 @@ class BrowserPanel(QFrame):
         except Exception:
             self._fallback_label.setText(
                 "Qt WebEngine is not available in this environment. "
-                "Managed Chromium still launches externally for inspect capture."
+                "Embedded inspect mode cannot start."
             )
             root.addWidget(self._fallback_label, 1)
 
+    @property
+    def web_view(self):
+        return self._web_view
+
+    @property
+    def has_web_view(self) -> bool:
+        return self._web_view is not None
+
+    @property
+    def current_title(self) -> str:
+        return self._current_title
+
+    @property
+    def current_url(self) -> str:
+        return self._current_url
+
     def load_url(self, url: str) -> None:
+        self._current_url = url or ""
         self.url_label.setText(f"URL: {url or '-'}")
         if self._web_view is not None and url:
             self._web_view.setUrl(QUrl(url))
 
     def set_page_info(self, title: str, url: str) -> None:
+        self._current_title = title or ""
+        self._current_url = url or self._current_url
         self.page_label.setText(f"Page: {title or '-'}")
         self.url_label.setText(f"URL: {url or '-'}")
 
@@ -337,20 +377,9 @@ class WorkspaceWindow(QMainWindow):
         self._fit_window_to_screen()
         self._set_icon()
 
-        self.bridge = EventBridge()
-        self.bridge.capture_received.connect(self._on_capture)
-        self.bridge.status_changed.connect(self._set_status)
-        self.bridge.page_changed.connect(self._on_page_changed)
-
-        self.browser = BrowserManager(
-            on_capture=lambda summary, candidates: self.bridge.capture_received.emit(summary, candidates),
-            on_status=lambda message: self.bridge.status_changed.emit(message),
-            on_page_info=lambda title, url: self.bridge.page_changed.emit(title, url),
-        )
-        self.browser.start()
-
         self.current_summary: ElementSummary | None = None
         self.current_candidates: list[LocatorCandidate] = []
+        self.current_page_context: PageContext | None = None
         self.project_root: Path | None = None
         self.selected_module: ModuleInfo | None = None
         self.discovered_pages: list[PageClassInfo] = []
@@ -359,6 +388,11 @@ class WorkspaceWindow(QMainWindow):
         self._available_modules: list[ModuleInfo] = []
         self._loading_workspace_state = False
         self._pending_inspect_restore = False
+        self._has_launched_page = False
+        self.learning_store = LearningStore()
+
+        self._embedded_channel: QWebChannel | None = None
+        self._embedded_bridge: EmbeddedInspectBridge | None = None
 
         self.top_bar = TopBar()
         self.project_path_input = self.top_bar.project_path_input
@@ -616,6 +650,7 @@ class WorkspaceWindow(QMainWindow):
         left_col.addStretch(1)
 
         self.browser_panel = BrowserPanel()
+        self._setup_embedded_browser_bridge()
         self.bottom_status_bar = BottomStatusBar()
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -647,6 +682,7 @@ class WorkspaceWindow(QMainWindow):
         self._update_generated_methods_preview()
         self._load_initial_workspace_state()
         self._update_add_button_state()
+        self._refresh_inspect_toggle_state()
         if not self.selected_module:
             self._set_status("Select project/module/page from the top bar to start.")
 
@@ -754,6 +790,7 @@ class WorkspaceWindow(QMainWindow):
         self.diff_preview_dock.setVisible(False)
 
     def _open_new_page_drawer(self) -> None:
+        self.logger.info("New Page handler invoked.")
         if not self.selected_module:
             self._set_status("Select module before creating page.")
             return
@@ -975,6 +1012,129 @@ class WorkspaceWindow(QMainWindow):
         if any(token in text for token in ("warning", "risky", "cancelled")):
             return "warning"
         return "ok"
+
+    def _setup_embedded_browser_bridge(self) -> None:
+        web_view = self.browser_panel.web_view
+        if web_view is None:
+            self._set_status("Embedded browser is unavailable; inspect is disabled.")
+            return
+
+        self._embedded_channel = QWebChannel(web_view.page())
+        self._embedded_bridge = EmbeddedInspectBridge()
+        self._embedded_bridge.payload_received.connect(self._on_embedded_capture_payload)
+        self._embedded_bridge.log_received.connect(self._on_embedded_js_log)
+        self._embedded_channel.registerObject("inspectBridge", self._embedded_bridge)
+        web_view.page().setWebChannel(self._embedded_channel)
+
+        web_view.loadFinished.connect(self._on_webview_load_finished)
+        web_view.titleChanged.connect(self._on_webview_title_changed)
+        web_view.urlChanged.connect(self._on_webview_url_changed)
+
+    def _refresh_inspect_toggle_state(self) -> None:
+        enabled = can_enable_inspect_toggle(
+            has_launched_page=self._has_launched_page,
+            has_embedded_browser=self.browser_panel.has_web_view,
+        )
+        self.inspect_toggle.setEnabled(enabled)
+
+    def _run_webview_js(self, script: str, callback=None) -> None:
+        web_view = self.browser_panel.web_view
+        if web_view is None:
+            return
+        page = web_view.page()
+        if callback is None:
+            page.runJavaScript(script)
+            return
+        page.runJavaScript(script, callback)
+
+    def _ensure_embedded_inspector_script(self) -> None:
+        self._run_webview_js(EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT)
+
+    def _set_embedded_inspect_mode(self, enabled: bool) -> None:
+        bool_literal = "true" if enabled else "false"
+        script = (
+            f"window.__inspectelementDesiredEnabled = {bool_literal};"
+            f"if (window.__inspectelementSetEnabled) window.__inspectelementSetEnabled({bool_literal});"
+        )
+        self._run_webview_js(script)
+
+    def _on_embedded_js_log(self, message: str) -> None:
+        clean = message.strip()
+        if not clean:
+            return
+        self.logger.info(clean)
+
+    def _on_embedded_capture_payload(self, payload: object) -> None:
+        self.logger.info("Embedded inspect click payload received.")
+        if not isinstance(payload, dict):
+            self._set_status("Inspect payload was invalid.")
+            return
+
+        summary_payload = payload.get("summary")
+        candidates_payload = payload.get("candidates")
+        if not isinstance(summary_payload, dict) or not isinstance(candidates_payload, list):
+            self._set_status("Inspect payload is missing summary/candidates.")
+            return
+
+        try:
+            summary = build_element_summary_from_payload(summary_payload)
+            learning_weights = self.learning_store.get_rule_weights()
+            candidates = build_locator_candidates_from_payload(candidates_payload, learning_weights=learning_weights, limit=5)
+
+            page_context = self._build_page_context_from_browser_panel()
+            self.current_page_context = page_context
+            if page_context is not None:
+                override = self.learning_store.get_override(page_context.hostname, summary.signature())
+                if override and not is_obvious_root_container_locator(override.locator):
+                    override_candidate = build_override_candidate(
+                        override=override,
+                        uniqueness_count=1,
+                        learning_weights=learning_weights,
+                    )
+                    candidates = inject_override_candidate(candidates, override_candidate, limit=5)
+
+            self._on_capture(summary, candidates)
+        except Exception as exc:
+            self._handle_ui_exception("Embedded inspect payload could not be processed.", exc)
+
+    def _build_page_context_from_browser_panel(self) -> PageContext | None:
+        current_url = self.browser_panel.current_url.strip()
+        if not current_url:
+            return None
+        parsed = urlparse(current_url)
+        return PageContext(
+            url=current_url,
+            hostname=parsed.hostname or "",
+            page_title=self.browser_panel.current_title.strip(),
+        )
+
+    def _on_webview_load_finished(self, ok: bool) -> None:
+        if not ok:
+            self._has_launched_page = False
+            self._refresh_inspect_toggle_state()
+            self._set_status("Embedded browser could not load the URL.")
+            return
+
+        self._has_launched_page = True
+        self._on_page_changed(self.browser_panel.current_title, self.browser_panel.current_url)
+        self._ensure_embedded_inspector_script()
+        self._refresh_inspect_toggle_state()
+        self._set_status("Embedded browser loaded.")
+
+        if self._pending_inspect_restore:
+            desired = bool(self.inspect_toggle.isChecked())
+            self._set_embedded_inspect_mode(desired)
+            self._pending_inspect_restore = False
+
+    def _on_webview_title_changed(self, title: str) -> None:
+        self.browser_panel.set_page_info(title or "", self.browser_panel.current_url)
+        self._on_page_changed(title or "", self.browser_panel.current_url)
+
+    def _on_webview_url_changed(self, url: QUrl) -> None:
+        url_text = url.toString().strip()
+        self.browser_panel.set_page_info(self.browser_panel.current_title, url_text)
+        self.url_input.setText(url_text)
+        self._persist_workspace_state()
 
     def _fit_window_to_screen(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -1780,7 +1940,13 @@ class WorkspaceWindow(QMainWindow):
         if not self.selected_module:
             self.discovered_pages = []
             self.page_combo.setEnabled(False)
-            self.new_page_button.setEnabled(False)
+            self.new_page_button.setEnabled(
+                can_enable_new_page_button(
+                    has_project_root=bool(self.project_root),
+                    has_module=False,
+                    has_pages_source_root=False,
+                )
+            )
             self.page_combo.blockSignals(False)
             self._update_add_button_state()
             return
@@ -1790,7 +1956,11 @@ class WorkspaceWindow(QMainWindow):
         for page in pages:
             self.page_combo.addItem(page.class_name, page)
 
-        can_create_page = bool(self.selected_module.pages_source_root)
+        can_create_page = can_enable_new_page_button(
+            has_project_root=bool(self.project_root),
+            has_module=True,
+            has_pages_source_root=bool(self.selected_module.pages_source_root),
+        )
         self.new_page_button.setEnabled(can_create_page)
         self.page_combo.setEnabled(bool(pages))
         if pages:
@@ -2084,21 +2254,31 @@ class WorkspaceWindow(QMainWindow):
         if not normalized:
             self._set_status("Please enter a URL.")
             return
+        if not self.browser_panel.has_web_view:
+            self._set_status("Embedded browser is not available in this runtime.")
+            return
         self.url_input.setText(normalized)
+        self._has_launched_page = False
+        desired_after_load = bool(self.inspect_toggle.isChecked()) or bool(self._pending_inspect_restore)
+        self._pending_inspect_restore = desired_after_load
         self.inspect_toggle.blockSignals(True)
-        self.inspect_toggle.setChecked(False)
+        self.inspect_toggle.setChecked(desired_after_load)
         self.inspect_toggle.blockSignals(False)
-        self.inspect_toggle.setText("Inspect: OFF")
-        self.inspect_toggle.setEnabled(False)
+        self.inspect_toggle.setText(f"Inspect: {'ON' if desired_after_load else 'OFF'}")
+        self._refresh_inspect_toggle_state()
         self.browser_panel.load_url(normalized)
-        self.browser.launch(normalized)
         self._set_status(f"Launching: {normalized}")
         self._persist_workspace_state()
 
     def _toggle_inspect(self) -> None:
         enabled = self.inspect_toggle.isChecked()
+        self.logger.info("Inspect toggle changed: %s", "ON" if enabled else "OFF")
         self.inspect_toggle.setText(f"Inspect: {'ON' if enabled else 'OFF'}")
-        self.browser.set_inspect_mode(enabled)
+        if not self.inspect_toggle.isEnabled():
+            self._set_status("Launch a page first.")
+            return
+        self._ensure_embedded_inspector_script()
+        self._set_embedded_inspect_mode(enabled)
         self._persist_workspace_state()
 
     def _copy(self, value: str) -> None:
@@ -2124,10 +2304,13 @@ class WorkspaceWindow(QMainWindow):
         self._show_toast("Secilen formatta locator yok")
 
     def _reset_learning(self) -> None:
-        self.browser.reset_learning()
+        self.learning_store.reset()
+        self._set_status("Learning store reset.")
+        self._show_toast("Learning reset")
 
     def _clear_overrides(self) -> None:
-        self.browser.clear_overrides()
+        self.learning_store.clear_overrides()
+        self._set_status("Overrides cleared.")
         self._show_toast("Overrides temizlendi")
 
     def _feedback(self, was_good: bool) -> None:
@@ -2136,13 +2319,19 @@ class WorkspaceWindow(QMainWindow):
             self._set_status("Select a locator first.")
             self._show_toast("Once bir locator sec")
             return
-        ok = self.browser.record_feedback(candidate, was_good)
-        if ok:
-            self._set_status("Feedback recorded.")
-            self._show_toast("Feedback eklendi")
+        if not self.current_summary:
+            self._set_status("Capture an element before sending feedback.")
+            self._show_toast("Once element secimi yap")
             return
-        self._set_status("Capture an element before sending feedback.")
-        self._show_toast("Once element secimi yap")
+
+        page_context = self._build_page_context_from_browser_panel()
+        if not page_context:
+            self._set_status("Launch a page before sending feedback.")
+            return
+        self.current_page_context = page_context
+        self.learning_store.record_feedback(page_context, self.current_summary, candidate, was_good)
+        self._set_status("Feedback recorded.")
+        self._show_toast("Feedback eklendi")
 
     def _good_edited(self) -> None:
         candidate = self._selected_candidate()
@@ -2152,14 +2341,33 @@ class WorkspaceWindow(QMainWindow):
             return
 
         edited = self.locator_editor.toPlainText().strip()
-        ok, message = self.browser.record_feedback_with_edited_locator(candidate, edited)
-        if ok:
-            self._set_status("Edited locator saved as override.")
-            self._show_toast("Edited locator kaydedildi")
+        if not edited:
+            self._set_status("Edited locator is empty.")
+            self._show_toast("Editor bos")
+            return
+        if is_obvious_root_container_locator(edited):
+            message = "Root container locators cannot be saved as overrides."
+            self._set_status(message)
+            self._show_toast(message)
+            return
+        if not self.current_summary:
+            self._set_status("Capture an element before saving override.")
+            return
+        page_context = self._build_page_context_from_browser_panel()
+        if not page_context:
+            self._set_status("Launch a page before saving override.")
             return
 
-        self._set_status(message)
-        self._show_toast(message)
+        feedback_candidate = replace(candidate, locator=edited)
+        self.learning_store.record_feedback(page_context, self.current_summary, feedback_candidate, True)
+        self.learning_store.save_override(
+            page_context.hostname,
+            self.current_summary.signature(),
+            feedback_candidate.locator_type,
+            edited,
+        )
+        self._set_status("Edited locator saved as override.")
+        self._show_toast("Edited locator kaydedildi")
 
     def _apply_edit(self) -> None:
         candidate = self._selected_candidate()
@@ -2244,13 +2452,9 @@ class WorkspaceWindow(QMainWindow):
             self.browser_panel.set_page_info(title, url)
         if url and hasattr(self, "url_input"):
             self.url_input.setText(url)
+        self.current_page_context = self._build_page_context_from_browser_panel()
         if hasattr(self, "inspect_toggle"):
-            self.inspect_toggle.setEnabled(True)
-            if self._pending_inspect_restore:
-                desired = bool(self.inspect_toggle.isChecked())
-                self.inspect_toggle.setText(f"Inspect: {'ON' if desired else 'OFF'}")
-                self.browser.set_inspect_mode(desired)
-                self._pending_inspect_restore = False
+            self._refresh_inspect_toggle_state()
         self._persist_workspace_state()
 
     def _set_status(self, message: str) -> None:
@@ -2435,7 +2639,6 @@ class WorkspaceWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt API)
         try:
             self._persist_workspace_state()
-            self.browser.shutdown()
         except Exception as exc:
             QMessageBox.warning(self, "Shutdown warning", str(exc))
         super().closeEvent(event)

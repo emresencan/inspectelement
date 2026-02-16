@@ -4,6 +4,8 @@ from pathlib import Path
 
 from inspectelement.ui_state import (
     WorkspaceState,
+    can_enable_inspect_toggle,
+    can_enable_new_page_button,
     compute_workspace_button_state,
     load_workspace_state,
     save_workspace_state,
@@ -58,3 +60,44 @@ def test_compute_workspace_button_state_with_pending_preview() -> None:
     assert state.can_validate is False
     assert state.can_apply is True
     assert state.can_cancel_preview is True
+
+
+def test_can_enable_new_page_button_requires_project_module_and_pages_root() -> None:
+    assert (
+        can_enable_new_page_button(
+            has_project_root=True,
+            has_module=True,
+            has_pages_source_root=True,
+        )
+        is True
+    )
+    assert (
+        can_enable_new_page_button(
+            has_project_root=False,
+            has_module=True,
+            has_pages_source_root=True,
+        )
+        is False
+    )
+    assert (
+        can_enable_new_page_button(
+            has_project_root=True,
+            has_module=False,
+            has_pages_source_root=True,
+        )
+        is False
+    )
+    assert (
+        can_enable_new_page_button(
+            has_project_root=True,
+            has_module=True,
+            has_pages_source_root=False,
+        )
+        is False
+    )
+
+
+def test_can_enable_inspect_toggle_requires_launch_and_embedded_browser() -> None:
+    assert can_enable_inspect_toggle(has_launched_page=True, has_embedded_browser=True) is True
+    assert can_enable_inspect_toggle(has_launched_page=False, has_embedded_browser=True) is False
+    assert can_enable_inspect_toggle(has_launched_page=True, has_embedded_browser=False) is False
