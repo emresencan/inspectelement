@@ -108,7 +108,8 @@ def can_enable_new_page_button(
     has_module: bool,
     has_pages_source_root: bool,
 ) -> bool:
-    return has_project_root and has_module and has_pages_source_root
+    _ = has_pages_source_root
+    return has_project_root and has_module
 
 
 def can_enable_inspect_toggle(*, has_launched_page: bool, has_embedded_browser: bool) -> bool:

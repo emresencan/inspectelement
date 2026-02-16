@@ -56,6 +56,8 @@ def test_template_contains_expected_standard() -> None:
     assert "import org.openqa.selenium.WebDriver;" in template
     assert "import com.turkcell.common.BaseLibrary;" in template
     assert "public class NewPageName extends BaseLibrary {" in template
+    assert "private final By BTN_EDIT_MODE =" in template
+    assert 'By.xpath("//a[contains(text(),\'Edit Moda Geç\')]");' in template
     assert "public NewPageName(WebDriver driver) {" in template
     assert "// region AUTO_LOCATORS" in template
     assert "// region AUTO_ACTIONS" in template
@@ -112,3 +114,26 @@ public class OrdersPage extends BaseLibrary {}
     preview = generate_page_creation_preview(module, pages, "OrdersPage")
     assert not preview.ok
     assert preview.message == "OrdersPage already exists."
+
+
+def test_page_creation_preview_uses_pages_module_when_source_root_missing(tmp_path: Path) -> None:
+    pages_module = tmp_path / "modules" / "apps" / "incentra" / "incentra-pages"
+    module = ModuleInfo(
+        name="incentra",
+        module_path=tmp_path / "modules" / "apps" / "incentra",
+        pages_module_path=pages_module,
+        pages_source_root=None,
+    )
+    preview = generate_page_creation_preview(module, [], "LoginPage")
+    assert preview.ok
+    assert preview.target_file == (
+        pages_module
+        / "src"
+        / "main"
+        / "java"
+        / "com"
+        / "turkcell"
+        / "pages"
+        / "incentra"
+        / "LoginPage.java"
+    )

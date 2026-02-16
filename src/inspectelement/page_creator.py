@@ -44,14 +44,15 @@ def generate_page_creation_preview(
             file_content=None,
         )
 
-    if module.pages_source_root is None:
+    pages_source_root = _resolve_pages_source_root(module)
+    if pages_source_root is None:
         return PageCreationPreview(
             ok=False,
             target_file=_fallback_target(module, class_name),
             class_name=class_name,
             package_name=None,
             base_library_import=None,
-            message="Pages source root not found for selected module.",
+            message="Pages module path not found for selected module.",
             diff_text="",
             file_content=None,
         )
@@ -70,7 +71,9 @@ def generate_page_creation_preview(
 
     package_name = detect_page_package(module, existing_pages)
     base_library_import = detect_base_library_import(module, existing_pages)
-    target_file = module.pages_source_root / Path(*package_name.split(".")) / f"{class_name}.java"
+    target_file = (
+        pages_source_root / Path(*package_name.split(".")) / f"{class_name}.java"
+    )
     if target_file.exists():
         return PageCreationPreview(
             ok=False,
@@ -120,7 +123,9 @@ def apply_page_creation_preview(preview: PageCreationPreview) -> tuple[bool, str
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:
-        fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        )
         temp_path = Path(temp_name)
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as temp_file:
             temp_file.write(preview.file_content)
@@ -149,7 +154,9 @@ def normalize_page_class_name(raw_value: str) -> tuple[str, str | None]:
     return normalized, None
 
 
-def detect_page_package(module: ModuleInfo, existing_pages: Sequence[PageClassInfo]) -> str:
+def detect_page_package(
+    module: ModuleInfo, existing_pages: Sequence[PageClassInfo]
+) -> str:
     package_counter: Counter[str] = Counter()
     for page in existing_pages:
         package_name = _extract_package_name(page.file_path)
@@ -158,7 +165,7 @@ def detect_page_package(module: ModuleInfo, existing_pages: Sequence[PageClassIn
     if package_counter:
         return package_counter.most_common(1)[0][0]
 
-    source_root = module.pages_source_root
+    source_root = _resolve_pages_source_root(module)
     if source_root and source_root.exists():
         java_candidates = sorted(source_root.rglob("*.java"))
         for candidate in java_candidates:
@@ -170,7 +177,9 @@ def detect_page_package(module: ModuleInfo, existing_pages: Sequence[PageClassIn
     return f"com.turkcell.pages.{module_segment}"
 
 
-def detect_base_library_import(module: ModuleInfo, existing_pages: Sequence[PageClassInfo]) -> str:
+def detect_base_library_import(
+    module: ModuleInfo, existing_pages: Sequence[PageClassInfo]
+) -> str:
     import_counter: Counter[str] = Counter()
     for page in existing_pages:
         import_name = _extract_base_library_import(page.file_path)
@@ -179,7 +188,7 @@ def detect_base_library_import(module: ModuleInfo, existing_pages: Sequence[Page
     if import_counter:
         return import_counter.most_common(1)[0][0]
 
-    source_root = module.pages_source_root
+    source_root = _resolve_pages_source_root(module)
     if source_root and source_root.exists():
         java_candidates = sorted(source_root.rglob("*.java"))
         for candidate in java_candidates:
@@ -190,7 +199,9 @@ def detect_base_library_import(module: ModuleInfo, existing_pages: Sequence[Page
     return DEFAULT_BASE_LIBRARY_IMPORT
 
 
-def build_page_template(package_name: str, class_name: str, base_library_import: str) -> str:
+def build_page_template(
+    package_name: str, class_name: str, base_library_import: str
+) -> str:
     return (
         f"package {package_name};\n"
         "\n"
@@ -199,9 +210,6 @@ def build_page_template(package_name: str, class_name: str, base_library_import:
         f"import {base_library_import};\n"
         "\n"
         f"public class {class_name} extends BaseLibrary {{\n"
-        "\n"
-        "    private final By BTN_EDIT_MODE =\n"
-        "        By.xpath(\"//a[contains(text(),'Edit Moda Geç')]\");\n"
         "\n"
         f"    public {class_name}(WebDriver driver) {{\n"
         "        super(driver);\n"
@@ -239,7 +247,15 @@ def _extract_base_library_import(java_file: Path) -> str | None:
 
 
 def _fallback_target(module: ModuleInfo, class_name_or_raw: str) -> Path:
-    base = module.pages_source_root or module.module_path
+    base = _resolve_pages_source_root(module) or module.module_path
     cleaned = class_name_or_raw.strip() or "NewPage"
     safe_name = re.sub(r"[^A-Za-z0-9]+", "", cleaned) or "NewPage"
     return base / f"{safe_name}.java"
+
+
+def _resolve_pages_source_root(module: ModuleInfo) -> Path | None:
+    if module.pages_source_root is not None:
+        return module.pages_source_root
+    if module.pages_module_path is not None:
+        return module.pages_module_path / "src" / "main" / "java"
+    return None

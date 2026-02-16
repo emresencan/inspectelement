@@ -62,12 +62,20 @@ def test_compute_workspace_button_state_with_pending_preview() -> None:
     assert state.can_cancel_preview is True
 
 
-def test_can_enable_new_page_button_requires_project_module_and_pages_root() -> None:
+def test_can_enable_new_page_button_requires_project_and_module() -> None:
     assert (
         can_enable_new_page_button(
             has_project_root=True,
             has_module=True,
             has_pages_source_root=True,
+        )
+        is True
+    )
+    assert (
+        can_enable_new_page_button(
+            has_project_root=True,
+            has_module=True,
+            has_pages_source_root=False,
         )
         is True
     )
@@ -84,14 +92,6 @@ def test_can_enable_new_page_button_requires_project_module_and_pages_root() -> 
             has_project_root=True,
             has_module=False,
             has_pages_source_root=True,
-        )
-        is False
-    )
-    assert (
-        can_enable_new_page_button(
-            has_project_root=True,
-            has_module=True,
-            has_pages_source_root=False,
         )
         is False
     )

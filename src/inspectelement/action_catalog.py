@@ -7,7 +7,15 @@ from .java_pom_writer import build_action_method_signature_preview
 
 ActionReturnKind = Literal["fluent", "string", "boolean"]
 ActionCategory = Literal["Click", "Read", "State", "Scroll", "JS", "Table", "ComboBox"]
-ActionAddTrigger = Literal["button_click", "checkbox_confirm", "hover", "mouse_move", "selection_change", "unknown"]
+ActionAddTrigger = Literal[
+    "button_click",
+    "checkbox_confirm",
+    "combo_activated",
+    "hover",
+    "mouse_move",
+    "selection_change",
+    "unknown",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +280,7 @@ ACTION_PRESETS: dict[str, tuple[str, ...]] = {
 }
 
 _ACTION_BY_KEY: dict[str, ActionSpec] = {spec.key: spec for spec in ACTION_CATALOG}
-_EXPLICIT_ADD_TRIGGERS: frozenset[str] = frozenset({"button_click", "checkbox_confirm"})
+_EXPLICIT_ADD_TRIGGERS: frozenset[str] = frozenset({"button_click", "checkbox_confirm", "combo_activated"})
 
 
 def list_action_specs(include_advanced: bool = True) -> tuple[ActionSpec, ...]:

@@ -16,11 +16,14 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLayout,
     QLayoutItem,
     QLabel,
@@ -179,9 +182,11 @@ class TopBar(QFrame):
 
         self.module_combo = QComboBox()
         self.module_combo.addItem("Select module", None)
+        self.module_combo.setMinimumWidth(160)
 
         self.page_combo = QComboBox()
         self.page_combo.addItem("Select page class", None)
+        self.page_combo.setMinimumWidth(160)
         self.page_combo.setEnabled(False)
         self.new_page_button = QPushButton("+ New Page")
         self.new_page_button.setEnabled(False)
@@ -204,13 +209,28 @@ class TopBar(QFrame):
         self.status_pill = QLabel("OK")
         self.status_pill.setObjectName("StatusPill")
         self.status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_pill.setMinimumWidth(76)
+        self.status_pill.setMaximumWidth(96)
+
+        fixed_buttons: list[tuple[QPushButton, int]] = [
+            (self.project_browse_button, 90),
+            (self.new_page_button, 110),
+            (self.launch_button, 88),
+            (self.inspect_toggle, 110),
+            (self.validate_button, 120),
+            (self.add_button, 130),
+            (self.apply_button, 80),
+            (self.cancel_preview_button, 120),
+        ]
+        for button, width in fixed_buttons:
+            button.setMinimumWidth(width)
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         layout = QGridLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(6)
-        layout.setColumnStretch(1, 2)
-        layout.setColumnStretch(6, 2)
+        layout.setColumnStretch(1, 4)
 
         layout.addWidget(QLabel("Project"), 0, 0)
         layout.addWidget(self.project_path_input, 0, 1, 1, 3)
@@ -258,6 +278,7 @@ class LeftPanel(QFrame):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.scroll_area = scroll
 
         content = QWidget()
         content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -268,6 +289,11 @@ class LeftPanel(QFrame):
         self.content_layout = content_layout
         scroll.setWidget(content)
         root.addWidget(scroll)
+
+    def ensure_widget_visible(self, widget: QWidget) -> None:
+        if not widget:
+            return
+        self.scroll_area.ensureWidgetVisible(widget, 12, 24)
 
 
 class BrowserPanel(QFrame):
@@ -356,6 +382,11 @@ class BottomStatusBar(QFrame):
         self.warning_value.setObjectName("TableRootWarning")
         self.write_value = QLabel("-")
         self.write_value.setObjectName("Muted")
+        for label in (self.last_action_value, self.warning_value, self.write_value):
+            label.setMinimumWidth(0)
+            label.setWordWrap(False)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(8, 6, 8, 6)
@@ -368,16 +399,25 @@ class BottomStatusBar(QFrame):
         root.addWidget(self.write_value, 2)
 
     def set_last_action(self, text: str) -> None:
-        self.last_action_value.setText(text or "-")
+        value = text or "-"
+        self.last_action_value.setText(value)
+        self.last_action_value.setToolTip(value)
 
     def set_warning(self, text: str) -> None:
-        self.warning_value.setText(text or "-")
+        value = text or "-"
+        self.warning_value.setText(value)
+        self.warning_value.setToolTip(value)
 
     def set_write_result(self, text: str) -> None:
-        self.write_value.setText(text or "-")
+        value = text or "-"
+        self.write_value.setText(value)
+        self.write_value.setToolTip(value)
 
 
 class WorkspaceWindow(QMainWindow):
+    CREATE_PAGE_COMBO_LABEL = "+ Create New Page..."
+    CREATE_PAGE_COMBO_TOKEN = "__create_new_page__"
+
     def __init__(self) -> None:
         super().__init__()
         self.logger = self._build_logger()
@@ -422,7 +462,7 @@ class WorkspaceWindow(QMainWindow):
         self.project_path_input.editingFinished.connect(self._on_project_path_changed)
         self.module_combo.currentIndexChanged.connect(self._on_module_changed)
         self.page_combo.currentIndexChanged.connect(self._on_page_combo_changed)
-        self.new_page_button.clicked.connect(self._open_new_page_drawer)
+        self.new_page_button.clicked.connect(self._create_new_page_flow)
         self.url_input.editingFinished.connect(self._persist_workspace_state)
         self.launch_button.clicked.connect(self._launch)
         self.inspect_toggle.clicked.connect(self._toggle_inspect)
@@ -485,9 +525,13 @@ class WorkspaceWindow(QMainWindow):
 
         self.action_dropdown = QComboBox()
         self.action_dropdown.currentIndexChanged.connect(self._on_action_dropdown_changed)
+        self.action_dropdown.activated.connect(self._on_action_dropdown_activated)
 
-        self.action_add_button = QPushButton("+ Add action")
-        self.action_add_button.clicked.connect(self._add_selected_dropdown_action)
+        self.action_add_button = QPushButton("Add")
+        self.action_add_button.setMinimumWidth(72)
+        self.action_add_button.clicked.connect(
+            lambda _checked=False: self._add_selected_dropdown_action(trigger="button_click")
+        )
 
         self.advanced_actions_checkbox = QCheckBox("Show advanced")
         self.advanced_actions_checkbox.setChecked(True)
@@ -806,6 +850,7 @@ class WorkspaceWindow(QMainWindow):
         self.logger.info("New Page handler invoked.")
         if not self.selected_module:
             self._set_status("Select module before creating page.")
+            self._show_toast("Select module first")
             return
         self.pending_page_preview = None
         self.new_page_name_input.clear()
@@ -815,8 +860,11 @@ class WorkspaceWindow(QMainWindow):
         self.new_page_diff_preview.clear()
         self.new_page_apply_button.setEnabled(False)
         self.new_page_drawer.setVisible(True)
+        self.new_page_drawer.raise_()
+        QTimer.singleShot(0, lambda: self.left_panel.ensure_widget_visible(self.new_page_drawer))
         self.new_page_name_input.setFocus()
         self._set_status("New page drawer opened.")
+        self._show_toast("New Page drawer opened")
 
     def _preview_new_page(self) -> None:
         if not self.selected_module:
@@ -1454,9 +1502,8 @@ class WorkspaceWindow(QMainWindow):
         add_row = QHBoxLayout()
         add_row.setContentsMargins(0, 0, 0, 0)
         add_row.setSpacing(6)
-        add_row.addWidget(QLabel("+ Add action"))
-        add_row.addWidget(self.action_search_input, 1)
-        add_row.addWidget(self.action_dropdown, 2)
+        add_row.addWidget(QLabel("Action"))
+        add_row.addWidget(self.action_dropdown, 1)
         add_row.addWidget(self.action_add_button)
         root_layout.addLayout(add_row)
 
@@ -1614,8 +1661,7 @@ class WorkspaceWindow(QMainWindow):
         self.action_add_button.setEnabled(self.action_dropdown.currentData() is not None)
 
     def _on_action_dropdown_activated(self, _index: int) -> None:
-        # Kept for backward compatibility; actions are added only via explicit add triggers.
-        return
+        self._add_selected_dropdown_action(trigger="combo_activated")
 
     def _add_selected_dropdown_action(self, trigger: str = "button_click") -> None:
         action_key = self.action_dropdown.currentData()
@@ -2010,8 +2056,11 @@ class WorkspaceWindow(QMainWindow):
             has_module=True,
             has_pages_source_root=bool(self.selected_module.pages_source_root),
         )
+        if can_create_page:
+            self.page_combo.addItem(self.CREATE_PAGE_COMBO_LABEL, self.CREATE_PAGE_COMBO_TOKEN)
+
         self.new_page_button.setEnabled(can_create_page)
-        self.page_combo.setEnabled(bool(pages))
+        self.page_combo.setEnabled(bool(pages) or can_create_page)
         if pages:
             selected_index = 1
             if previous_class_name:
@@ -2036,24 +2085,115 @@ class WorkspaceWindow(QMainWindow):
         return None
 
     def _on_page_combo_changed(self, _index: int) -> None:
+        if self.page_combo.currentData() == self.CREATE_PAGE_COMBO_TOKEN:
+            self._create_new_page_flow()
+            return
         self.page_combo_previous_index = self.page_combo.currentIndex()
         self._cancel_pending_preview(clear_status=False)
         self._update_add_button_state()
         self._persist_workspace_state()
 
     def _create_new_page_flow(self) -> None:
-        self._open_new_page_drawer()
+        self.logger.info("New Page handler invoked.")
+        restore_selection = self.page_combo.currentData() == self.CREATE_PAGE_COMBO_TOKEN
+        if not self.selected_module:
+            self._set_status("Select module before creating page.")
+            self._show_toast("Select module first")
+            if restore_selection:
+                self._restore_page_combo_selection()
+            return
 
-    def _show_page_creation_preview(self, preview: PageCreationPreview) -> None:
-        self.pending_page_preview = preview
-        self.new_page_drawer.setVisible(True)
-        self.new_page_name_input.setText(preview.class_name or "")
-        self.new_page_package_label.setText(f"Package: {preview.package_name or '-'}")
-        self.new_page_target_label.setText(f"Target: {preview.target_file}")
-        self.new_page_file_preview.setPlainText(preview.file_content or "")
-        self.new_page_diff_preview.setPlainText(preview.diff_text or "")
-        self.new_page_apply_button.setEnabled(preview.ok)
-        self._set_status(preview.message)
+        raw_page_name, ok_pressed = QInputDialog.getText(
+            self,
+            "Create New Page",
+            "Page Name (PascalCase):",
+            text="",
+        )
+        if not ok_pressed:
+            self._set_status("Cancelled — no page created.")
+            if restore_selection:
+                self._restore_page_combo_selection()
+            return
+
+        preview = generate_page_creation_preview(
+            module=self.selected_module,
+            existing_pages=self.discovered_pages,
+            page_name_raw=raw_page_name.strip(),
+        )
+        if not preview.ok:
+            self._set_status(preview.message)
+            QMessageBox.warning(self, "Create New Page", preview.message)
+            if restore_selection:
+                self._restore_page_combo_selection()
+            return
+
+        applied = self._show_page_creation_preview(preview)
+        if not applied:
+            if restore_selection:
+                self._restore_page_combo_selection()
+            return
+
+        created_class_name = preview.class_name
+        self._refresh_page_classes()
+        if created_class_name:
+            self._select_page_in_combo(created_class_name)
+        self._update_add_button_state()
+        self._persist_workspace_state()
+
+    def _show_page_creation_preview(self, preview: PageCreationPreview) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Preview New Page")
+        dialog.resize(900, 640)
+
+        root = QVBoxLayout(dialog)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        package_value = preview.package_name or "-"
+        info = QLabel(f"Package: {package_value}\nTarget: {preview.target_file}")
+        info.setObjectName("Muted")
+        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(info)
+
+        content_label = QLabel("Generated File")
+        content_label.setObjectName("SectionTitle")
+        root.addWidget(content_label)
+
+        file_preview = QPlainTextEdit()
+        file_preview.setReadOnly(True)
+        file_preview.setPlainText(preview.file_content or "")
+        file_preview.setMinimumHeight(220)
+        root.addWidget(file_preview, 1)
+
+        diff_label = QLabel("Unified Diff Preview")
+        diff_label.setObjectName("SectionTitle")
+        root.addWidget(diff_label)
+
+        diff_preview = QPlainTextEdit()
+        diff_preview.setReadOnly(True)
+        diff_preview.setPlainText(preview.diff_text or "")
+        diff_preview.setMinimumHeight(180)
+        root.addWidget(diff_preview, 1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        create_button = button_box.button(QDialogButtonBox.StandardButton.Ok)
+        if create_button is not None:
+            create_button.setText("Create Page")
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        root.addWidget(button_box)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._set_status("Cancelled — no page created.")
+            return False
+
+        applied, message = apply_page_creation_preview(preview)
+        self._set_status(message)
+        self._show_toast(message)
+        if not applied:
+            QMessageBox.warning(self, "Create New Page", message)
+            return False
+        return True
 
     def _restore_page_combo_selection(self) -> None:
         target_index = self.page_combo_previous_index

@@ -97,4 +97,5 @@ def test_explicit_action_add_trigger_changes_selected_actions() -> None:
     added = add_action_by_trigger(selected, "getText", trigger="button_click")
     assert added == ["clickElement", "getText"]
     assert should_add_action_from_trigger("button_click") is True
+    assert should_add_action_from_trigger("combo_activated") is True
     assert should_add_action_from_trigger("hover") is False
