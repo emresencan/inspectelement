@@ -1,5 +1,6 @@
 from inspectelement.action_catalog import (
     ACTION_PRESETS,
+    add_action_by_trigger,
     build_signature_previews,
     filter_action_specs,
     has_combo_actions,
@@ -7,6 +8,7 @@ from inspectelement.action_catalog import (
     normalize_selected_actions,
     required_parameter_keys,
     return_kind_badge,
+    should_add_action_from_trigger,
 )
 
 
@@ -80,3 +82,19 @@ def test_table_common_preset_includes_extended_actions() -> None:
     assert "tableClickInFirstRow" in table_common
     assert "tableClickRadioInRow" in table_common
     assert "tableClickLink" in table_common
+
+
+def test_hover_or_mouse_move_does_not_add_action() -> None:
+    selected = ["clickElement"]
+    hovered = add_action_by_trigger(selected, "getText", trigger="hover")
+    moved = add_action_by_trigger(selected, "getText", trigger="mouse_move")
+    assert hovered == ["clickElement"]
+    assert moved == ["clickElement"]
+
+
+def test_explicit_action_add_trigger_changes_selected_actions() -> None:
+    selected = ["clickElement"]
+    added = add_action_by_trigger(selected, "getText", trigger="button_click")
+    assert added == ["clickElement", "getText"]
+    assert should_add_action_from_trigger("button_click") is True
+    assert should_add_action_from_trigger("hover") is False

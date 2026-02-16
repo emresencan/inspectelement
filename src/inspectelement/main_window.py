@@ -8,7 +8,7 @@ import sys
 from typing import Any
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QPoint, QRect, QSize, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, QSettings, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication, QIcon
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWidgets import (
@@ -42,6 +42,7 @@ from .action_catalog import (
     ACTION_PRESETS,
     CATEGORY_FILTERS,
     ActionSignaturePreview,
+    add_action_by_trigger,
     action_label,
     build_signature_previews,
     filter_action_specs,
@@ -244,6 +245,7 @@ class LeftPanel(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("LeftPanel")
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -253,8 +255,12 @@ class LeftPanel(QFrame):
         scroll.setObjectName("LeftScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         content = QWidget()
+        content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(10, 10, 10, 10)
         content_layout.setSpacing(8)
@@ -268,6 +274,7 @@ class BrowserPanel(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("BrowserPanel")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self._web_view = None
         self._current_title = ""
@@ -298,6 +305,7 @@ class BrowserPanel(QFrame):
             from PySide6.QtWebEngineWidgets import QWebEngineView  # type: ignore
 
             self._web_view = QWebEngineView(self)
+            self._web_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self._web_view.setUrl(QUrl("about:blank"))
             root.addWidget(self._web_view, 1)
             self._fallback_label.hide()
@@ -389,6 +397,7 @@ class WorkspaceWindow(QMainWindow):
         self._loading_workspace_state = False
         self._pending_inspect_restore = False
         self._has_launched_page = False
+        self._settings = QSettings("inspectelement", "workspace")
         self.learning_store = LearningStore()
 
         self._embedded_channel: QWebChannel | None = None
@@ -476,7 +485,6 @@ class WorkspaceWindow(QMainWindow):
 
         self.action_dropdown = QComboBox()
         self.action_dropdown.currentIndexChanged.connect(self._on_action_dropdown_changed)
-        self.action_dropdown.activated.connect(self._on_action_dropdown_activated)
 
         self.action_add_button = QPushButton("+ Add action")
         self.action_add_button.clicked.connect(self._add_selected_dropdown_action)
@@ -653,19 +661,23 @@ class WorkspaceWindow(QMainWindow):
         self._setup_embedded_browser_bridge()
         self.bottom_status_bar = BottomStatusBar()
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.left_panel)
-        splitter.addWidget(self.browser_panel)
-        splitter.setStretchFactor(0, 35)
-        splitter.setStretchFactor(1, 65)
-        splitter.setChildrenCollapsible(False)
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter.setObjectName("WorkspaceSplitter")
+        self.left_panel.setMinimumWidth(400)
+        self.browser_panel.setMinimumWidth(700)
+        self.workspace_splitter.addWidget(self.left_panel)
+        self.workspace_splitter.addWidget(self.browser_panel)
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.splitterMoved.connect(self._save_splitter_sizes)
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
         root_layout.addWidget(self.top_bar)
-        root_layout.addWidget(splitter, 1)
+        root_layout.addWidget(self.workspace_splitter, 1)
         root_layout.addWidget(self.bottom_status_bar)
         self.setCentralWidget(root)
 
@@ -677,6 +689,7 @@ class WorkspaceWindow(QMainWindow):
         self._toast_timer.timeout.connect(self.toast_label.hide)
 
         self._apply_style()
+        self._restore_splitter_sizes()
         self._refresh_table_root_section()
         self._refresh_parameter_panel()
         self._update_generated_methods_preview()
@@ -1013,6 +1026,38 @@ class WorkspaceWindow(QMainWindow):
             return "warning"
         return "ok"
 
+    def _restore_splitter_sizes(self) -> None:
+        if not hasattr(self, "workspace_splitter"):
+            return
+
+        saved_sizes = self._settings.value("workspace/splitter_sizes")
+        parsed: list[int] = []
+        if isinstance(saved_sizes, list):
+            for item in saved_sizes[:2]:
+                try:
+                    value = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    parsed.append(value)
+        if len(parsed) == 2:
+            self.workspace_splitter.setSizes(parsed)
+            return
+
+        left_default = 420
+        right_default = max(900, self.width() - left_default)
+        self.workspace_splitter.setSizes([left_default, right_default])
+
+    def _save_splitter_sizes(self, *_args) -> None:
+        if not hasattr(self, "workspace_splitter"):
+            return
+        sizes = self.workspace_splitter.sizes()
+        if len(sizes) < 2:
+            return
+        if sizes[0] <= 0 or sizes[1] <= 0:
+            return
+        self._settings.setValue("workspace/splitter_sizes", [int(sizes[0]), int(sizes[1])])
+
     def _setup_embedded_browser_bridge(self) -> None:
         web_view = self.browser_panel.web_view
         if web_view is None:
@@ -1139,12 +1184,12 @@ class WorkspaceWindow(QMainWindow):
     def _fit_window_to_screen(self) -> None:
         screen = QGuiApplication.primaryScreen()
         if not screen:
-            self.resize(1200, 700)
+            self.resize(1240, 760)
             return
 
         available = screen.availableGeometry()
-        target_width = max(980, min(1320, available.width() - 48))
-        target_height = max(600, min(720, available.height() - 72))
+        target_width = max(1120, min(1600, available.width() - 36))
+        target_height = max(680, min(920, available.height() - 56))
         target_width = min(target_width, available.width() - 16)
         target_height = min(target_height, available.height() - 16)
         x = available.x() + max(8, (available.width() - target_width) // 2)
@@ -1569,13 +1614,17 @@ class WorkspaceWindow(QMainWindow):
         self.action_add_button.setEnabled(self.action_dropdown.currentData() is not None)
 
     def _on_action_dropdown_activated(self, _index: int) -> None:
-        self._add_selected_dropdown_action()
+        # Kept for backward compatibility; actions are added only via explicit add triggers.
+        return
 
-    def _add_selected_dropdown_action(self) -> None:
+    def _add_selected_dropdown_action(self, trigger: str = "button_click") -> None:
         action_key = self.action_dropdown.currentData()
         if not isinstance(action_key, str):
             return
-        self._add_action(action_key)
+        updated = add_action_by_trigger(self.selected_actions, action_key, trigger=trigger)
+        if updated == self.selected_actions:
+            return
+        self._set_selected_actions(updated)
         self.action_search_input.clear()
         self._refresh_action_dropdown()
 
@@ -2638,6 +2687,7 @@ class WorkspaceWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt API)
         try:
+            self._save_splitter_sizes()
             self._persist_workspace_state()
         except Exception as exc:
             QMessageBox.warning(self, "Shutdown warning", str(exc))

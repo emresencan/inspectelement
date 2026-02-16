@@ -7,6 +7,7 @@ from .java_pom_writer import build_action_method_signature_preview
 
 ActionReturnKind = Literal["fluent", "string", "boolean"]
 ActionCategory = Literal["Click", "Read", "State", "Scroll", "JS", "Table", "ComboBox"]
+ActionAddTrigger = Literal["button_click", "checkbox_confirm", "hover", "mouse_move", "selection_change", "unknown"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +272,7 @@ ACTION_PRESETS: dict[str, tuple[str, ...]] = {
 }
 
 _ACTION_BY_KEY: dict[str, ActionSpec] = {spec.key: spec for spec in ACTION_CATALOG}
+_EXPLICIT_ADD_TRIGGERS: frozenset[str] = frozenset({"button_click", "checkbox_confirm"})
 
 
 def list_action_specs(include_advanced: bool = True) -> tuple[ActionSpec, ...]:
@@ -314,6 +316,25 @@ def normalize_selected_actions(action_keys: Iterable[str]) -> list[str]:
             continue
         normalized.append(key)
     return normalized
+
+
+def should_add_action_from_trigger(trigger: str) -> bool:
+    return trigger in _EXPLICIT_ADD_TRIGGERS
+
+
+def add_action_by_trigger(
+    selected_actions: Iterable[str],
+    action_key: str,
+    trigger: ActionAddTrigger | str,
+) -> list[str]:
+    normalized = normalize_selected_actions(selected_actions)
+    if not should_add_action_from_trigger(str(trigger)):
+        return normalized
+    if action_key not in _ACTION_BY_KEY:
+        return normalized
+    if action_key in normalized:
+        return normalized
+    return normalized + [action_key]
 
 
 def has_table_actions(selected_actions: Iterable[str]) -> bool:
