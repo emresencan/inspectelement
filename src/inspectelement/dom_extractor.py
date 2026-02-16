@@ -32,9 +32,36 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
           }
 
           const classList = Array.from(el.classList || []);
-          const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+          const liveValue = (typeof el.value === 'string') ? el.value : '';
+          const normalizedInnerText = (el.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 240);
+          const normalizedTextContent = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 240);
+          const text = (normalizedInnerText || normalizedTextContent || liveValue || '').trim();
           const labels = el.labels ? Array.from(el.labels) : [];
           const labelText = labels.length ? (labels[0].innerText || labels[0].textContent || '').trim().replace(/\s+/g, ' ') : null;
+          const previousSiblingText = el.previousElementSibling
+            ? (el.previousElementSibling.innerText || el.previousElementSibling.textContent || '').trim().replace(/\s+/g, ' ')
+            : '';
+          const outerHtml = (el.outerHTML || '').slice(0, 1500);
+
+          const tagName = (el.tagName || '').toLowerCase();
+          if (liveValue) attrs.value = liveValue;
+          const hrefValue = (el.getAttribute('href') || (el.href || '') || '').trim();
+          if (hrefValue) attrs.href = hrefValue;
+          const titleValue = (el.getAttribute('title') || '').trim();
+          if (titleValue) attrs.title = titleValue;
+          const typeValue = (el.getAttribute('type') || '').trim();
+          if (typeValue) attrs.type = typeValue;
+          if (explicitRole) attrs.role = explicitRole;
+          if (el.getAttribute('data-testid')) attrs['data-testid'] = el.getAttribute('data-testid');
+          if (el.getAttribute('data-test')) attrs['data-test'] = el.getAttribute('data-test');
+          if (el.getAttribute('data-qa')) attrs['data-qa'] = el.getAttribute('data-qa');
+          if (el.getAttribute('data-cy')) attrs['data-cy'] = el.getAttribute('data-cy');
+          if (el.getAttribute('placeholder')) attrs.placeholder = el.getAttribute('placeholder');
+          if (el.getAttribute('aria-label')) attrs['aria-label'] = el.getAttribute('aria-label');
+          if (el.getAttribute('aria-labelledby')) attrs['aria-labelledby'] = el.getAttribute('aria-labelledby');
+          if (normalizedTextContent) attrs.__text_content = normalizedTextContent;
+          attrs.__tag = tagName;
+          if (previousSiblingText) attrs.__prev_sibling_text = previousSiblingText;
 
           const ancestry = [];
           let current = el;
@@ -49,10 +76,13 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
               id: current.id || '',
               role: current.getAttribute('role') || '',
               class: current.className || '',
+              style: current.getAttribute('style') || '',
+              'aria-hidden': current.getAttribute('aria-hidden') || '',
               nth: String(nth),
               'data-testid': current.getAttribute('data-testid') || '',
               'data-test': current.getAttribute('data-test') || '',
               'data-qa': current.getAttribute('data-qa') || '',
+              'data-cy': current.getAttribute('data-cy') || '',
             });
             current = current.parentElement;
           }
@@ -67,6 +97,8 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
             placeholder: el.getAttribute('placeholder') || null,
             aria_label: el.getAttribute('aria-label') || null,
             label_text: labelText || null,
+            outer_html: outerHtml || null,
+            sibling_label_text: previousSiblingText || null,
             attributes: attrs,
             ancestry,
           };
@@ -116,6 +148,8 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
         placeholder=payload.get("placeholder"),
         aria_label=payload.get("aria_label"),
         label_text=payload.get("label_text"),
+        outer_html=payload.get("outer_html"),
+        sibling_label_text=payload.get("sibling_label_text"),
         attributes={str(k): str(v) for k, v in payload.get("attributes", {}).items()},
         ancestry=ancestry,
         table_root=table_root,

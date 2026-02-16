@@ -18,10 +18,14 @@ class ElementSummary:
     placeholder: str | None
     aria_label: str | None
     label_text: str | None
+    outer_html: str | None = None
+    sibling_label_text: str | None = None
     attributes: dict[str, str] = field(default_factory=dict)
     ancestry: list[dict[str, str]] = field(default_factory=list)
     table_root: dict[str, str] | None = None
     table_roots: list[dict[str, str]] = field(default_factory=list)
+    raw_target: dict[str, str] | None = None
+    refined_target: dict[str, str] | None = None
 
     def signature(self) -> str:
         keys = ("id", "name", "data-testid", "data-test", "data-qa", "aria-label", "type")

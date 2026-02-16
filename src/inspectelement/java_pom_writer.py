@@ -308,6 +308,13 @@ def prepare_java_patch(
             message = " ".join(notes)
         else:
             message = "No changes generated."
+        if not added_methods:
+            if notes and any(note.startswith("Selector already exists as") for note in notes):
+                message = f"{message} No new action method selected; nothing to write."
+            elif notes and any(note.startswith("Table selector already exists as") for note in notes):
+                message = f"{message} No new table action method selected; nothing to write."
+            elif not notes:
+                message = "No changes generated. Select at least one action or choose a different locator/name."
         return JavaPatchResult(
             ok=True,
             changed=False,

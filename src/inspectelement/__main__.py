@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+import os
 import sys
+
+
+def _configure_webengine_logging() -> None:
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    current_flags = {item.strip() for item in flags.split() if item.strip()}
+    for required in ("--disable-logging", "--log-level=3", "--v=0"):
+        current_flags.add(required)
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(sorted(current_flags))
+    rules = os.environ.get("QT_LOGGING_RULES", "").strip()
+    extra_rules = "qt.webengine.console=false;qt.qpa.fonts.warning=false"
+    if rules:
+        if extra_rules not in rules:
+            os.environ["QT_LOGGING_RULES"] = f"{rules};{extra_rules}"
+    else:
+        os.environ["QT_LOGGING_RULES"] = extra_rules
 
 
 def main() -> int:
@@ -9,12 +25,13 @@ def main() -> int:
             "inspectelement requires Python 3.11+. "
             f"Current interpreter: {sys.executable} (Python {sys.version.split()[0]})"
         )
+    _configure_webengine_logging()
     print(f"[inspectelement doctor] sys.executable={sys.executable}")
     print(f"[inspectelement doctor] sys.version={sys.version}")
     try:
         from PySide6.QtGui import QColor, QPalette
         from PySide6.QtWidgets import QApplication
-        from .main_window import MainWindow
+        from .main_window import WorkspaceWindow
     except ModuleNotFoundError as exc:
         if exc.name == "PySide6":
             raise SystemExit(
@@ -40,7 +57,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     _apply_light_palette(app)
-    window = MainWindow()
+    window = WorkspaceWindow()
     window.show()
     return app.exec()
 

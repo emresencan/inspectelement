@@ -26,7 +26,23 @@ BASE_RULE_SCORES: dict[str, float] = {
     "ancestor": 66.0,
     "meaningful_class": 54.0,
     "text_role": 52.0,
-    "xpath_text": 40.0,
+    "attr:placeholder": 76.0,
+    "attr:title": 64.0,
+    "attr:role": 68.0,
+    "attr:type": 62.0,
+    "attr:href": 72.0,
+    "attr:aria-labelledby": 70.0,
+    "attr:alt": 66.0,
+    "xpath_text_exact": 74.0,
+    "xpath_text": 68.0,
+    "xpath_text_clickable": 72.0,
+    "xpath_text_clickable_union": 70.0,
+    "xpath_text_contains": 58.0,
+    "xpath_modal_text": 78.0,
+    "xpath_following_sibling": 74.0,
+    "xpath_ancestor_context": 64.0,
+    "xpath_label_contains": 72.0,
+    "xpath_fallback": 8.0,
     # 6) Last resort
     "nth_fallback": 10.0,
 }
@@ -61,10 +77,20 @@ def score_candidate(
     dynamic_penalty = 0.0
     if candidate.metadata.get("uses_nth"):
         dynamic_penalty += 80.0
+    if candidate.metadata.get("uses_index"):
+        dynamic_penalty += 24.0
+    if candidate.metadata.get("wrapper_based"):
+        dynamic_penalty += 36.0
     if candidate.metadata.get("dynamic_class_count", 0):
         dynamic_penalty += 10.0 + 2.0 * float(
             candidate.metadata.get("dynamic_class_count", 0)
         )
+    if candidate.locator_type == "XPath":
+        lowered = candidate.locator.lower()
+        if len(candidate.locator) > 140:
+            dynamic_penalty += min(42.0, (len(candidate.locator) - 140) / 2.0)
+        if any(token in lowered for token in ("modals", "modal", "container", "wrapper", "header", "content")):
+            dynamic_penalty += 18.0
     depth = candidate.locator.count(">") if candidate.locator_type == "CSS" else 0
     nth_count = candidate.locator.count("nth-of-type(")
     depth_penalty = float(depth * 12)
@@ -81,6 +107,8 @@ def score_candidate(
     )
     if candidate.rule == "nth_fallback":
         total = min(total, 45.0)
+    if candidate.rule == "xpath_fallback":
+        total = min(total, 18.0)
     breakdown = ScoreBreakdown(
         uniqueness=round(uniqueness, 2),
         stability=round(stability, 2),

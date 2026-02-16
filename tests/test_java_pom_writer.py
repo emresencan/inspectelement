@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 
 from inspectelement.java_pom_writer import (
     SAFE_PARSE_ERROR,
+    apply_java_preview,
     build_action_method_signature_preview,
+    generate_java_preview,
     prepare_java_patch,
 )
 
@@ -616,3 +619,89 @@ def test_style_alignment_preserves_crlf_line_endings() -> None:
     assert result.changed
     assert "\r\n" in result.updated_source
     assert "\r\nprivate final By" not in result.updated_source  # keeps class indentation
+
+
+def test_generate_and_apply_preview_writes_file_and_backup(tmp_path: Path) -> None:
+    target_file = tmp_path / "FolderPage.java"
+    target_file.write_text(
+        """public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+""",
+        encoding="utf-8",
+    )
+
+    preview = generate_java_preview(
+        target_file=target_file,
+        locator_name="HOME_BTN",
+        selector_type="xpath",
+        selector_value="//button[normalize-space()='Home']",
+        actions=("clickElement",),
+    )
+    assert preview.ok
+
+    applied, message, backup_path = apply_java_preview(preview)
+    assert applied
+    assert "Applied. Backup created at" in message
+    assert backup_path is not None
+    assert backup_path.exists()
+
+    updated = target_file.read_text(encoding="utf-8")
+    assert "private final By HOME_BTN = By.xpath(\"//button[normalize-space()='Home']\");" in updated
+    assert "public FolderPage clickHomeBtn()" in updated
+
+
+def test_apply_preview_rejects_when_target_changed_after_preview(tmp_path: Path) -> None:
+    target_file = tmp_path / "FolderPage.java"
+    original = """public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+    target_file.write_text(original, encoding="utf-8")
+
+    preview = generate_java_preview(
+        target_file=target_file,
+        locator_name="HOME_BTN",
+        selector_type="xpath",
+        selector_value="//button[normalize-space()='Home']",
+        actions=("clickElement",),
+    )
+    assert preview.ok
+
+    target_file.write_text(original + "\n// external change", encoding="utf-8")
+    applied, message, backup_path = apply_java_preview(preview)
+    assert not applied
+    assert "Target file changed after preview." in message
+    assert backup_path is None
+
+
+def test_no_change_message_guides_user_when_selector_exists_and_no_action() -> None:
+    source = """public class FolderPage extends BaseLibrary {
+    private final By EXISTING = By.xpath("//button[normalize-space()='Kaydet']");
+
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+
+    result = prepare_java_patch(
+        source=source,
+        locator_name="KAYDET_BTN",
+        selector_type="xpath",
+        selector_value="//button[normalize-space()='Kaydet']",
+        actions=(),
+    )
+    assert result.ok
+    assert not result.changed
+    assert "No new action method selected; nothing to write." in result.message

@@ -4,19 +4,20 @@ import logging
 from pathlib import Path
 import re
 import sys
+from typing import Any
+from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QPoint, QRect, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication, QIcon
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, QTimer, Qt, Signal, QEvent
+from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication, QIcon, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
-    QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
-    QInputDialog,
     QHBoxLayout,
     QLayout,
     QLayoutItem,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -48,8 +50,6 @@ from .action_catalog import (
     required_parameter_keys,
     return_kind_badge,
 )
-from .context_wizard import ContextSelection, ContextWizardDialog
-from .diff_preview_dialog import DiffPreviewDialog
 from .java_pom_writer import (
     JavaPreview,
     apply_java_preview,
@@ -64,15 +64,28 @@ from .page_creator import (
     generate_page_creation_preview,
 )
 from .project_discovery import ModuleInfo, PageClassInfo, discover_page_classes
+from .project_discovery import discover_modules
+from .ui_state import (
+    WorkspaceConfig,
+    can_enable_inspect,
+    can_enable_new_page,
+    compute_enable_state,
+    load_workspace_config,
+    save_workspace_config,
+)
 from .validation import validate_generation_request
 
-CREATE_NEW_PAGE_OPTION = "__CREATE_NEW_PAGE__"
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+except Exception:  # pragma: no cover - environment-dependent
+    QWebEngineView = None  # type: ignore[assignment]
 
 
 class EventBridge(QObject):
     capture_received = Signal(object, object)
     status_changed = Signal(str)
     page_changed = Signal(str, str)
+    hover_box_changed = Signal(object)
 
 
 class FlowLayout(QLayout):
@@ -146,7 +159,485 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y()
 
 
-class MainWindow(QMainWindow):
+class TopBar(QFrame):
+    def __init__(
+        self,
+        *,
+        project_input: QLineEdit,
+        project_browse_button: QPushButton,
+        module_combo: QComboBox,
+        page_combo: QComboBox,
+        new_page_button: QPushButton,
+        url_input: QLineEdit,
+        launch_button: QPushButton,
+        inspect_toggle: QPushButton,
+        toggle_left_button: QPushButton,
+        open_managed_button: QPushButton,
+        validate_button: QPushButton,
+        preview_button: QPushButton,
+        apply_button: QPushButton,
+        cancel_button: QPushButton,
+        status_pill: QLabel,
+    ) -> None:
+        super().__init__()
+        self.setObjectName("Card")
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+
+        layout.addWidget(QLabel("Project"), 0, 0)
+        layout.addWidget(project_input, 0, 1, 1, 4)
+        layout.addWidget(project_browse_button, 0, 5)
+
+        layout.addWidget(QLabel("Module"), 0, 6)
+        layout.addWidget(module_combo, 0, 7)
+        layout.addWidget(QLabel("Page"), 0, 8)
+        layout.addWidget(page_combo, 0, 9)
+        layout.addWidget(new_page_button, 0, 10)
+
+        layout.addWidget(QLabel("URL"), 1, 0)
+        layout.addWidget(url_input, 1, 1, 1, 5)
+        layout.addWidget(launch_button, 1, 6)
+        layout.addWidget(inspect_toggle, 1, 7)
+        layout.addWidget(toggle_left_button, 1, 8)
+        layout.addWidget(open_managed_button, 1, 9)
+        layout.addWidget(validate_button, 1, 10)
+        layout.addWidget(preview_button, 1, 11)
+        layout.addWidget(apply_button, 1, 12)
+        layout.addWidget(cancel_button, 1, 13)
+        layout.addWidget(status_pill, 1, 14)
+
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(9, 1)
+        layout.setColumnMinimumWidth(14, 150)
+
+
+class InspectWebEngineView(QWebEngineView if QWebEngineView is not None else QWidget):
+    inspect_click = Signal(float, float)
+    inspect_hover = Signal(float, float)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._inspect_mode = False
+        self.setMouseTracking(True)
+
+    def set_inspect_mode(self, enabled: bool) -> None:
+        self._inspect_mode = bool(enabled)
+        self.setCursor(Qt.CursorShape.CrossCursor if self._inspect_mode else Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt API)
+        if self._inspect_mode and event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            self.inspect_click.emit(float(pos.x()), float(pos.y()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt API)
+        if self._inspect_mode and event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt API)
+        if self._inspect_mode and event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt API)
+        if self._inspect_mode:
+            pos = event.position()
+            self.inspect_hover.emit(float(pos.x()), float(pos.y()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+
+class BrowserPanel(QFrame):
+    inspect_capture = Signal(dict)
+    inspect_hover_probe = Signal(dict)
+    page_changed = Signal(str, str)
+    load_finished = Signal(bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("Card")
+        self.webview = None
+        self._page_title = ""
+        self._page_url = ""
+        self._inspect_enabled = False
+        self._show_clickable_target_outline = False
+        self._filtered_widgets: list[QWidget] = []
+        self._selection_overlay: QFrame | None = None
+        self._clickable_overlay: QFrame | None = None
+        self._click_marker: QFrame | None = None
+        self._hover_last_point: tuple[int, int] | None = None
+        self._hover_pending_point: tuple[float, float] | None = None
+        self._hover_probe_interval_ms = 45
+        self._hover_probe_timer = QTimer(self)
+        self._hover_probe_timer.setSingleShot(True)
+        self._hover_probe_timer.setInterval(self._hover_probe_interval_ms)
+        self._hover_probe_timer.timeout.connect(self._dispatch_hover_probe)
+        self._click_marker_timer = QTimer(self)
+        self._click_marker_timer.setSingleShot(True)
+        self._click_marker_timer.setInterval(280)
+        self._click_marker_timer.timeout.connect(self._hide_click_marker)
+        self.info_label = QLabel(
+            "Embedded browser view. Inspect capture uses managed Chromium session for locator extraction."
+        )
+        self.info_label.setObjectName("Muted")
+        self.info_label.setWordWrap(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel("Browser"))
+        layout.addWidget(self.info_label)
+
+        if QWebEngineView is not None:
+            try:
+                self.webview = InspectWebEngineView(self)
+                layout.addWidget(self.webview, 1)
+                self._wire_webview()
+            except Exception:
+                self.webview = None
+
+        if self.webview is None:
+            fallback = QPlainTextEdit()
+            fallback.setReadOnly(True)
+            fallback.setPlainText(
+                "Qt WebEngine is not available in this environment.\n"
+                "Managed Chromium window will still be used for Inspect mode."
+            )
+            layout.addWidget(fallback, 1)
+        else:
+            self._install_webview_event_filters()
+
+    def load_url(self, url: str) -> None:
+        if not self.webview:
+            return
+        from PySide6.QtCore import QUrl
+
+        self.webview.load(QUrl(url))
+
+    def set_inspector_enabled(self, enabled: bool) -> None:
+        self._inspect_enabled = bool(enabled)
+        if not self.webview:
+            return
+        if enabled:
+            self._install_webview_event_filters()
+        self.webview.set_inspect_mode(enabled)
+        if not enabled:
+            self._hover_probe_timer.stop()
+            self._hover_pending_point = None
+            self._hide_selection_overlay()
+            self._hide_click_marker()
+
+    def _wire_webview(self) -> None:
+        if not self.webview:
+            return
+        page = self.webview.page()
+        page.loadFinished.connect(self._on_load_finished)
+        self.webview.titleChanged.connect(self._on_title_changed)
+        self.webview.urlChanged.connect(self._on_url_changed)
+        self.webview.inspect_click.connect(self._on_inspect_click)
+        self.webview.inspect_hover.connect(self._on_inspect_hover)
+        self._install_webview_event_filters()
+        self._ensure_selection_overlay()
+        self._ensure_clickable_overlay()
+        self._ensure_click_marker()
+
+    def _on_load_finished(self, ok: bool) -> None:
+        self.load_finished.emit(bool(ok))
+        self._install_webview_event_filters()
+        self._hover_probe_timer.stop()
+        self._hover_pending_point = None
+        self._hide_selection_overlay()
+        self._hide_click_marker()
+        if ok and self._inspect_enabled:
+            self.set_inspector_enabled(True)
+
+    def _on_title_changed(self, title: str) -> None:
+        self._page_title = title or ""
+        self.page_changed.emit(self._page_title, self._page_url)
+
+    def _on_url_changed(self, url) -> None:
+        self._page_url = url.toString()
+        self.page_changed.emit(self._page_title, self._page_url)
+
+    def _on_inspect_click(self, x: float, y: float) -> None:
+        if not self._inspect_enabled or not self.webview:
+            return
+        self._install_webview_event_filters()
+        self._emit_inspect_payload(x, y, self.inspect_capture)
+        self._emit_inspect_payload(x, y, self.inspect_hover_probe)
+        self._show_click_marker(x, y)
+
+    def _on_inspect_hover(self, x: float, y: float) -> None:
+        if not self._inspect_enabled:
+            return
+        point = (int(round(x)), int(round(y)))
+        if point == self._hover_last_point:
+            return
+        self._hover_last_point = point
+        self._hover_pending_point = (x, y)
+        if not self._hover_probe_timer.isActive():
+            self._hover_probe_timer.start()
+
+    def eventFilter(self, watched, event):  # noqa: N802 (Qt API)
+        if not self._inspect_enabled or not self.webview:
+            return super().eventFilter(watched, event)
+
+        event_type = event.type()
+        mouse_events = (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseMove,
+        )
+        if event_type not in mouse_events:
+            return super().eventFilter(watched, event)
+        if not isinstance(event, QMouseEvent):
+            return super().eventFilter(watched, event)
+        if event_type != QEvent.Type.MouseMove and event.button() != Qt.MouseButton.LeftButton:
+            return super().eventFilter(watched, event)
+
+        if not isinstance(watched, QWidget):
+            return super().eventFilter(watched, event)
+        if watched is not self.webview and not self.webview.isAncestorOf(watched):
+            return super().eventFilter(watched, event)
+        local_pos = watched.mapTo(self.webview, event.position().toPoint())
+        if event_type == QEvent.Type.MouseButtonPress:
+            self._on_inspect_click(float(local_pos.x()), float(local_pos.y()))
+        elif event_type == QEvent.Type.MouseMove:
+            self._on_inspect_hover(float(local_pos.x()), float(local_pos.y()))
+        event.accept()
+        return True
+
+    def viewport_size(self) -> tuple[int, int]:
+        if not self.webview:
+            return 1280, 720
+        return max(1, self.webview.width()), max(1, self.webview.height())
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt API)
+        self._clear_webview_event_filters()
+        super().closeEvent(event)
+
+    def _install_webview_event_filters(self) -> None:
+        if not self.webview:
+            return
+        widgets: list[QWidget] = [self.webview]
+        widgets.extend(self.webview.findChildren(QWidget))
+        for widget in widgets:
+            if widget in self._filtered_widgets:
+                continue
+            widget.installEventFilter(self)
+            self._filtered_widgets.append(widget)
+
+    def _clear_webview_event_filters(self) -> None:
+        for widget in self._filtered_widgets:
+            try:
+                widget.removeEventFilter(self)
+            except RuntimeError:
+                continue
+        self._filtered_widgets.clear()
+
+    def _ensure_selection_overlay(self) -> None:
+        if not self.webview or self._selection_overlay:
+            return
+        overlay = QFrame(self.webview)
+        overlay.setObjectName("SelectionOverlay")
+        overlay.setStyleSheet(
+            "QFrame#SelectionOverlay { border: 2px solid #0284c7; background: transparent; border-radius: 2px; }"
+        )
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        overlay.hide()
+        self._selection_overlay = overlay
+
+    def _ensure_clickable_overlay(self) -> None:
+        if not self.webview or self._clickable_overlay:
+            return
+        overlay = QFrame(self.webview)
+        overlay.setObjectName("ClickableOverlay")
+        overlay.setStyleSheet(
+            "QFrame#ClickableOverlay { border: 1px dashed #38bdf8; background: transparent; border-radius: 2px; }"
+        )
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        overlay.hide()
+        self._clickable_overlay = overlay
+
+    def _ensure_click_marker(self) -> None:
+        if not self.webview or self._click_marker:
+            return
+        marker = QFrame(self.webview)
+        marker.setObjectName("ClickMarker")
+        marker.setFixedSize(14, 14)
+        marker.setStyleSheet(
+            "QFrame#ClickMarker { border: 2px solid #f97316; background: rgba(249,115,22,0.18); border-radius: 7px; }"
+        )
+        marker.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        marker.hide()
+        self._click_marker = marker
+
+    def _hide_selection_overlay(self) -> None:
+        if self._selection_overlay:
+            self._selection_overlay.hide()
+        if self._clickable_overlay:
+            self._clickable_overlay.hide()
+        self._hover_last_point = None
+        self._hover_pending_point = None
+
+    def _hide_click_marker(self) -> None:
+        if self._click_marker:
+            self._click_marker.hide()
+
+    def _show_click_marker(self, x: float, y: float) -> None:
+        if not self._click_marker:
+            return
+        marker_x = int(round(x)) - (self._click_marker.width() // 2)
+        marker_y = int(round(y)) - (self._click_marker.height() // 2)
+        self._click_marker.move(marker_x, marker_y)
+        self._click_marker.show()
+        self._click_marker.raise_()
+        self._click_marker_timer.start()
+
+    def _emit_inspect_payload(self, x: float, y: float, emit_signal: Signal) -> None:
+        if not self.webview:
+            return
+        fallback_payload = {
+            "x": x,
+            "y": y,
+            "viewport_width": max(1, self.webview.width()),
+            "viewport_height": max(1, self.webview.height()),
+            "scroll_x": 0,
+            "scroll_y": 0,
+            "url": self._page_url,
+            "device_pixel_ratio": 1.0,
+        }
+        page = self.webview.page()
+        script = (
+            "() => ({"
+            "innerWidth: window.innerWidth || 0,"
+            "innerHeight: window.innerHeight || 0,"
+            "scrollX: window.scrollX || 0,"
+            "scrollY: window.scrollY || 0,"
+            "devicePixelRatio: window.devicePixelRatio || 1,"
+            "href: window.location && window.location.href ? window.location.href : ''"
+            "})"
+        )
+
+        def _on_metrics(result: object) -> None:
+            payload = dict(fallback_payload)
+            if isinstance(result, dict):
+                try:
+                    payload["viewport_width"] = int(result.get("innerWidth", payload["viewport_width"])) or payload[
+                        "viewport_width"
+                    ]
+                    payload["viewport_height"] = int(result.get("innerHeight", payload["viewport_height"])) or payload[
+                        "viewport_height"
+                    ]
+                    payload["scroll_x"] = int(result.get("scrollX", 0))
+                    payload["scroll_y"] = int(result.get("scrollY", 0))
+                    payload["device_pixel_ratio"] = float(result.get("devicePixelRatio", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    pass
+                href = str(result.get("href", "") or "").strip()
+                if href:
+                    payload["url"] = href
+            emit_signal.emit(payload)
+
+        page.runJavaScript(script, _on_metrics)
+
+    def _dispatch_hover_probe(self) -> None:
+        if not self._inspect_enabled:
+            return
+        point = self._hover_pending_point
+        self._hover_pending_point = None
+        if not point:
+            return
+        self._emit_inspect_payload(point[0], point[1], self.inspect_hover_probe)
+
+    def set_show_clickable_target_outline(self, enabled: bool) -> None:
+        self._show_clickable_target_outline = bool(enabled)
+        if not self._show_clickable_target_outline and self._clickable_overlay:
+            self._clickable_overlay.hide()
+
+    def apply_hover_box(self, rect: dict[str, Any] | None) -> None:
+        if not self._selection_overlay:
+            return
+        if not rect:
+            self._selection_overlay.hide()
+            if self._clickable_overlay:
+                self._clickable_overlay.hide()
+            return
+        raw_rect = rect.get("raw", rect) if isinstance(rect, dict) else None
+        refined_rect = rect.get("refined") if isinstance(rect, dict) else None
+        if not isinstance(raw_rect, dict):
+            self._selection_overlay.hide()
+            if self._clickable_overlay:
+                self._clickable_overlay.hide()
+            return
+        try:
+            left = int(round(float(raw_rect.get("left", 0))))
+            top = int(round(float(raw_rect.get("top", 0))))
+            width = max(1, int(round(float(raw_rect.get("width", 1)))))
+            height = max(1, int(round(float(raw_rect.get("height", 1)))))
+        except (TypeError, ValueError):
+            self._selection_overlay.hide()
+            if self._clickable_overlay:
+                self._clickable_overlay.hide()
+            return
+        self._selection_overlay.setGeometry(left, top, width, height)
+        self._selection_overlay.show()
+        self._selection_overlay.raise_()
+        if self._show_clickable_target_outline and self._clickable_overlay and isinstance(refined_rect, dict):
+            try:
+                r_left = int(round(float(refined_rect.get("left", 0))))
+                r_top = int(round(float(refined_rect.get("top", 0))))
+                r_width = max(1, int(round(float(refined_rect.get("width", 1)))))
+                r_height = max(1, int(round(float(refined_rect.get("height", 1)))))
+            except (TypeError, ValueError):
+                self._clickable_overlay.hide()
+            else:
+                if r_left == left and r_top == top and r_width == width and r_height == height:
+                    self._clickable_overlay.hide()
+                    return
+                self._clickable_overlay.setGeometry(r_left, r_top, r_width, r_height)
+                self._clickable_overlay.show()
+                self._clickable_overlay.raise_()
+        elif self._clickable_overlay:
+            self._clickable_overlay.hide()
+
+
+class BottomStatusBar(QFrame):
+    def __init__(self, status_label: QLabel, warning_label: QLabel, result_label: QLabel) -> None:
+        super().__init__()
+        self.setObjectName("Card")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(10)
+        layout.addWidget(status_label, 2)
+        layout.addWidget(warning_label, 2)
+        layout.addWidget(result_label, 3)
+
+
+class LeftPanel(QFrame):
+    def __init__(self, content: QWidget) -> None:
+        super().__init__()
+        self.setObjectName("Card")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+
+
+class WorkspaceWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.logger = self._build_logger()
@@ -157,31 +648,50 @@ class MainWindow(QMainWindow):
         self.bridge = EventBridge()
         self.bridge.capture_received.connect(self._on_capture)
         self.bridge.status_changed.connect(self._set_status)
-        self.bridge.page_changed.connect(self._on_page_changed)
+        self.bridge.page_changed.connect(self._on_managed_page_changed)
+        self.bridge.hover_box_changed.connect(self._on_hover_box_changed)
 
         self.browser = BrowserManager(
             on_capture=lambda summary, candidates: self.bridge.capture_received.emit(summary, candidates),
             on_status=lambda message: self.bridge.status_changed.emit(message),
             on_page_info=lambda title, url: self.bridge.page_changed.emit(title, url),
+            on_hover_box=lambda rect: self.bridge.hover_box_changed.emit(rect),
         )
-        self.browser.start()
+        self._browser_worker_started = False
 
         self.current_summary: ElementSummary | None = None
         self.current_candidates: list[LocatorCandidate] = []
+        self.current_visible_candidates: list[LocatorCandidate] = []
+        self.show_advanced_locators = False
+        self.last_hover_raw_target: dict[str, str] | None = None
+        self.last_hover_refined_target: dict[str, str] | None = None
         self.project_root: Path | None = None
         self.selected_module: ModuleInfo | None = None
+        self.available_modules: list[ModuleInfo] = []
         self.discovered_pages: list[PageClassInfo] = []
         self.pending_java_preview: JavaPreview | None = None
+        self.pending_page_creation_preview: PageCreationPreview | None = None
+        self.workspace_config_path = Path.home() / ".inspectelement" / "config.json"
 
         self.url_input = QLineEdit("https://example.com")
         self.url_input.setPlaceholderText("https://your-app-url")
+        self.url_input.editingFinished.connect(self._persist_workspace_config)
 
         self.launch_button = QPushButton("Launch Browser")
         self.launch_button.clicked.connect(self._launch)
 
         self.inspect_toggle = QPushButton("Inspect Mode: OFF")
         self.inspect_toggle.setCheckable(True)
+        self.inspect_toggle.setEnabled(False)
         self.inspect_toggle.clicked.connect(self._toggle_inspect)
+        self.show_clickable_target_outline_checkbox = QCheckBox("Show clickable target outline")
+        self.show_clickable_target_outline_checkbox.setChecked(False)
+        self.show_clickable_target_outline_checkbox.toggled.connect(self._on_show_clickable_outline_toggled)
+        self.toggle_left_panel_button = QPushButton("Hide Panel")
+        self.toggle_left_panel_button.clicked.connect(self._toggle_left_panel)
+        self.open_managed_inspector_button = QPushButton("Open Managed Inspector")
+        self.open_managed_inspector_button.setEnabled(False)
+        self.open_managed_inspector_button.clicked.connect(self._open_managed_inspector)
 
         self.output_format_combo = QComboBox()
         self.output_format_combo.addItems(["Best", "CSS", "XPath", "Playwright", "Selenium"])
@@ -198,17 +708,23 @@ class MainWindow(QMainWindow):
         self.exit_button = QPushButton("Exit")
         self.exit_button.clicked.connect(self.close)
 
-        self.context_value_label = QLabel("Project: - | Module: -")
-        self.context_value_label.setObjectName("Muted")
-        self.context_value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.change_context_button = QPushButton("Change")
-        self.change_context_button.clicked.connect(self._change_context)
+        self.project_input = QLineEdit()
+        self.project_input.setPlaceholderText("Select automation project root")
+        self.project_input.editingFinished.connect(self._on_project_root_edited)
+        self.project_browse_button = QPushButton("Browse...")
+        self.project_browse_button.clicked.connect(self._browse_project_root)
+
+        self.module_combo = QComboBox()
+        self.module_combo.addItem("Select module", None)
+        self.module_combo.currentIndexChanged.connect(self._on_module_changed)
 
         self.page_combo = QComboBox()
         self.page_combo.addItem("Select page class", None)
         self.page_combo.setEnabled(False)
         self.page_combo.currentIndexChanged.connect(self._on_page_combo_changed)
         self.page_combo_previous_index = 0
+        self.new_page_button = QPushButton("+ New Page")
+        self.new_page_button.clicked.connect(self._toggle_new_page_drawer)
 
         self.runtime_info_label = QLabel(self._runtime_summary())
         self.runtime_info_label.setObjectName("Muted")
@@ -267,6 +783,9 @@ class MainWindow(QMainWindow):
         self.table_root_section.setObjectName("TableRootSection")
         self.table_root_locator_preview = QLineEdit()
         self.table_root_locator_preview.setReadOnly(True)
+        self.table_root_choice_combo = QComboBox()
+        self.table_root_choice_combo.currentIndexChanged.connect(self._on_table_root_choice_changed)
+        self.table_root_choice_combo.setVisible(False)
         self.table_root_warning_label = QLabel("")
         self.table_root_warning_label.setObjectName("TableRootWarning")
         self.pick_table_root_button = QPushButton("Pick Table Root")
@@ -299,13 +818,39 @@ class MainWindow(QMainWindow):
         self.add_button = QPushButton("Add")
         self.add_button.setEnabled(False)
         self.add_button.clicked.connect(self._prepare_add_request)
+        self.add_button.setText("Add -> Preview")
         self.validate_button = QPushButton("Validate Only")
         self.validate_button.setEnabled(False)
         self.validate_button.clicked.connect(self._validate_only_request)
+        self.apply_preview_button = QPushButton("Apply")
+        self.apply_preview_button.setEnabled(False)
+        self.apply_preview_button.clicked.connect(self._apply_pending_preview)
+        self.cancel_preview_button = QPushButton("Cancel Preview")
+        self.cancel_preview_button.setEnabled(False)
+        self.cancel_preview_button.clicked.connect(self._cancel_preview)
+        self.left_add_button = QPushButton("Add")
+        self.left_add_button.setToolTip("Generate diff preview for current element/action selection")
+        self.left_add_button.setEnabled(False)
+        self.left_add_button.clicked.connect(self._prepare_add_request)
+        self.left_apply_preview_button = QPushButton("Apply")
+        self.left_apply_preview_button.setEnabled(False)
+        self.left_apply_preview_button.clicked.connect(self._apply_pending_preview)
+        self.left_cancel_preview_button = QPushButton("Cancel Preview")
+        self.left_cancel_preview_button.setEnabled(False)
+        self.left_cancel_preview_button.clicked.connect(self._cancel_preview)
+        self.top_status_pill = QLabel("OK")
+        self.top_status_pill.setObjectName("StatusPill")
 
         self.payload_status_label = QLabel("Waiting for page, locator, and element name.")
         self.payload_status_label.setObjectName("Muted")
         self.payload_status_label.setWordWrap(True)
+
+        self.bottom_status_label = QLabel("Ready.")
+        self.bottom_status_label.setObjectName("Muted")
+        self.bottom_warning_label = QLabel("")
+        self.bottom_warning_label.setObjectName("Muted")
+        self.bottom_result_label = QLabel("")
+        self.bottom_result_label.setObjectName("Muted")
 
         self.results_table = QTableWidget(0, 5)
         self.results_table.setHorizontalHeaderLabels(["Rank", "Type", "Locator", "Score", "Guidance"])
@@ -317,7 +862,7 @@ class MainWindow(QMainWindow):
         self.results_table.setShowGrid(True)
         self.results_table.setGridStyle(Qt.PenStyle.SolidLine)
         self.results_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.results_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.results_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.results_table.horizontalHeader().setStretchLastSection(False)
         self.results_table.horizontalHeader().setSectionResizeMode(0, self.results_table.horizontalHeader().ResizeMode.Fixed)
         self.results_table.horizontalHeader().setSectionResizeMode(1, self.results_table.horizontalHeader().ResizeMode.Fixed)
@@ -331,13 +876,27 @@ class MainWindow(QMainWindow):
         self.results_table.verticalHeader().setDefaultSectionSize(36)
         self.results_table.setMinimumHeight(225)
         self.results_table.setMaximumHeight(245)
+        self.show_advanced_locators_checkbox = QCheckBox("Show advanced locators")
+        self.show_advanced_locators_checkbox.setChecked(False)
+        self.show_advanced_locators_checkbox.toggled.connect(self._on_show_advanced_locators_toggled)
 
         self.detail_labels: dict[str, QLabel] = {}
         detail_form = QFormLayout()
         detail_form.setContentsMargins(0, 0, 0, 0)
         detail_form.setHorizontalSpacing(12)
         detail_form.setVerticalSpacing(4)
-        for key in ["tag", "id", "classes", "name", "role", "text", "placeholder", "aria-label"]:
+        for key in [
+            "tag",
+            "id",
+            "classes",
+            "name",
+            "role",
+            "text",
+            "placeholder",
+            "aria-label",
+            "raw-target",
+            "refined-target",
+        ]:
             label = QLabel("-")
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             label.setWordWrap(True)
@@ -365,6 +924,37 @@ class MainWindow(QMainWindow):
         self.locator_editor.setObjectName("Editor")
         self.locator_editor.setMaximumHeight(96)
 
+        self.preview_file_label = QLabel("Target file: -")
+        self.preview_file_label.setObjectName("Muted")
+        self.preview_meta_label = QLabel("Preview not generated.")
+        self.preview_meta_label.setObjectName("Muted")
+        self.preview_diff_editor = QPlainTextEdit()
+        self.preview_diff_editor.setReadOnly(True)
+        self.preview_diff_editor.setPlaceholderText("Unified diff preview appears here after Add -> Preview.")
+        self.preview_diff_editor.setMaximumHeight(220)
+        self.preview_dock = QFrame()
+        self.preview_dock.setObjectName("Card")
+        self.preview_dock.setVisible(False)
+
+        self.new_page_drawer = QFrame()
+        self.new_page_drawer.setObjectName("Card")
+        self.new_page_drawer.setVisible(False)
+        self.new_page_name_input = QLineEdit()
+        self.new_page_name_input.setPlaceholderText("Page Name (PascalCase)")
+        self.new_page_name_input.textChanged.connect(self._preview_new_page_inline)
+        self.new_page_package_label = QLabel("Package: -")
+        self.new_page_package_label.setObjectName("Muted")
+        self.new_page_target_label = QLabel("Target: -")
+        self.new_page_target_label.setObjectName("Muted")
+        self.new_page_preview_editor = QPlainTextEdit()
+        self.new_page_preview_editor.setReadOnly(True)
+        self.new_page_preview_editor.setMaximumHeight(180)
+        self.new_page_apply_button = QPushButton("Create Page")
+        self.new_page_apply_button.setEnabled(False)
+        self.new_page_apply_button.clicked.connect(self._apply_new_page_inline)
+        self.new_page_cancel_button = QPushButton("Cancel")
+        self.new_page_cancel_button.clicked.connect(self._cancel_new_page_inline)
+
         feedback_row = QHBoxLayout()
         feedback_row.addWidget(self.good_button)
         feedback_row.addWidget(self.bad_button)
@@ -374,134 +964,140 @@ class MainWindow(QMainWindow):
         editor_actions_row.addWidget(self.copy_edited_button)
         editor_actions_row.addWidget(self.good_edited_button)
 
-        header_card = QFrame()
-        header_card.setObjectName("Card")
-        header_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        header_layout = QVBoxLayout(header_card)
-
-        title_label = QLabel("Inspect Element for Automation")
-        title_label.setObjectName("Title")
-        subtitle_label = QLabel("Open a URL, enable inspect mode, click an element, and copy the best locator.")
-        subtitle_label.setObjectName("Muted")
-
-        quick_start = QLabel(
-            """
-            <b>Quick Start</b><br/>
-            1. Enter URL and click <b>Launch Browser</b>.<br/>
-            2. Click <b>Inspect Mode: OFF</b> to turn it ON.<br/>
-            3. Click any element in the browser page.<br/>
-            4. Pick a locator row or use <b>Copy</b> with selected format.
-            """
+        top_bar = TopBar(
+            project_input=self.project_input,
+            project_browse_button=self.project_browse_button,
+            module_combo=self.module_combo,
+            page_combo=self.page_combo,
+            new_page_button=self.new_page_button,
+            url_input=self.url_input,
+            launch_button=self.launch_button,
+            inspect_toggle=self.inspect_toggle,
+            toggle_left_button=self.toggle_left_panel_button,
+            open_managed_button=self.open_managed_inspector_button,
+            validate_button=self.validate_button,
+            preview_button=self.add_button,
+            apply_button=self.apply_preview_button,
+            cancel_button=self.cancel_preview_button,
+            status_pill=self.top_status_pill,
         )
-        quick_start.setObjectName("Help")
-        quick_start.setWordWrap(True)
-        quick_start.setMaximumHeight(100)
 
-        header_layout.addWidget(title_label)
-        header_layout.addWidget(subtitle_label)
-        header_layout.addWidget(quick_start)
-
-        controls_card = QFrame()
-        controls_card.setObjectName("Card")
-        controls_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        controls_layout = QGridLayout(controls_card)
-        controls_layout.setColumnStretch(1, 1)
-
-        url_label = QLabel("Target URL")
-        url_label.setObjectName("FieldLabel")
-        format_label = QLabel("Copy Format")
-        format_label.setObjectName("FieldLabel")
-        context_label = QLabel("Context")
-        context_label.setObjectName("FieldLabel")
-        page_label = QLabel("Page Class")
-        page_label.setObjectName("FieldLabel")
-
-        controls_layout.addWidget(url_label, 0, 0)
-        controls_layout.addWidget(self.url_input, 0, 1, 1, 5)
-        controls_layout.addWidget(self.launch_button, 1, 0)
-        controls_layout.addWidget(self.inspect_toggle, 1, 1)
-        controls_layout.addWidget(format_label, 1, 2)
-        controls_layout.addWidget(self.output_format_combo, 1, 3)
-        controls_layout.addWidget(self.copy_best_button, 1, 4)
-        controls_layout.addWidget(self.reset_learning_button, 1, 5)
-        controls_layout.addWidget(self.clear_overrides_button, 1, 6)
-        controls_layout.addWidget(self.exit_button, 1, 7)
-        controls_layout.addWidget(context_label, 2, 0)
-        controls_layout.addWidget(self.context_value_label, 2, 1, 1, 6)
-        controls_layout.addWidget(self.change_context_button, 2, 7)
-        controls_layout.addWidget(page_label, 3, 0)
-        controls_layout.addWidget(self.page_combo, 3, 1, 1, 3)
-        controls_layout.addWidget(self.runtime_info_label, 4, 0, 1, 8)
-
-        left_card = QFrame()
-        left_card.setObjectName("Card")
-        left_card_layout = QVBoxLayout(left_card)
-        left_card_layout.setContentsMargins(0, 0, 0, 0)
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Left panel with always-visible control workspace
         left_content = QWidget()
         left_col = QVBoxLayout(left_content)
-        left_title = QLabel("Locator Suggestions")
-        left_title.setObjectName("SectionTitle")
-        left_hint = QLabel("After clicking an element in Inspect Mode, top 5 locator candidates appear below.")
-        left_hint.setObjectName("Muted")
-        left_col.addWidget(left_title)
-        left_col.addWidget(left_hint)
-        left_col.addWidget(self.results_table)
-        left_col.addWidget(QLabel("Locator Editor:"))
-        left_col.addWidget(self.locator_editor)
-        left_col.addLayout(editor_actions_row)
-        left_col.addWidget(QLabel("Element Name:"))
-        left_col.addWidget(self.element_name_input)
-        left_col.addWidget(QLabel("Action Picker:"))
+
+        self.snapshot_card = QFrame()
+        self.snapshot_card.setObjectName("Card")
+        snapshot_layout = QVBoxLayout(self.snapshot_card)
+        snapshot_layout.setContentsMargins(8, 8, 8, 8)
+        snapshot_layout.addWidget(QLabel("Element Snapshot"))
+        snapshot_layout.addWidget(self.show_clickable_target_outline_checkbox)
+        snapshot_layout.addLayout(detail_form)
+        snapshot_layout.addWidget(QLabel("Element Name"))
+        snapshot_layout.addWidget(self.element_name_input)
+        snapshot_layout.addWidget(QLabel("Locator Editor"))
+        snapshot_layout.addWidget(self.locator_editor)
+        snapshot_layout.addLayout(editor_actions_row)
+        snapshot_layout.addWidget(self.payload_status_label)
+        left_col.addWidget(self.snapshot_card)
+        left_col.addWidget(self.new_page_drawer)
+
+        self.candidates_card = QFrame()
+        self.candidates_card.setObjectName("Card")
+        candidates_layout = QVBoxLayout(self.candidates_card)
+        candidates_layout.setContentsMargins(8, 8, 8, 8)
+        candidates_layout.addWidget(QLabel("Locator Candidates"))
+        candidates_layout.addWidget(self.show_advanced_locators_checkbox)
+        candidates_layout.addWidget(self.results_table)
+        self.score_breakdown_label = QLabel("Score Breakdown")
+        candidates_layout.addWidget(self.score_breakdown_label)
+        candidates_layout.addWidget(self.breakdown_text)
+        self.feedback_row_container = QWidget()
+        self.feedback_row_container.setLayout(feedback_row)
+        candidates_layout.addWidget(self.feedback_row_container)
+        left_col.addWidget(self.candidates_card)
+
+        self.actions_section_label = QLabel("Actions")
+        left_col.addWidget(self.actions_section_label)
         left_col.addWidget(self.action_picker_widget)
         left_col.addWidget(self._build_table_root_section())
         left_col.addWidget(self._build_parameter_panel())
-        left_col.addWidget(QLabel("Generated Methods Preview:"))
+
+        log_row = QHBoxLayout()
+        log_row.addWidget(QLabel("Log"))
+        log_row.addWidget(self.log_language_combo)
+        log_row.addStretch(1)
+        left_col.addLayout(log_row)
+
+        generate_row = QHBoxLayout()
+        generate_row.setContentsMargins(0, 0, 0, 0)
+        generate_row.setSpacing(6)
+        generate_row.addWidget(self.left_add_button)
+        generate_row.addWidget(self.left_apply_preview_button)
+        generate_row.addWidget(self.left_cancel_preview_button)
+        generate_row.addStretch(1)
+        left_col.addLayout(generate_row)
+
+        self.generated_preview_label = QLabel("Generated Methods Preview")
+        left_col.addWidget(self.generated_preview_label)
         left_col.addWidget(self.generated_methods_preview)
 
-        action_row = QHBoxLayout()
-        action_row.addWidget(QLabel("Log:"))
-        action_row.addWidget(self.log_language_combo)
-        action_row.addStretch(1)
-        action_row.addWidget(self.validate_button)
-        action_row.addWidget(self.add_button)
-        left_col.addLayout(action_row)
-        left_col.addWidget(self.payload_status_label)
+        preview_layout = QVBoxLayout(self.preview_dock)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_layout.addWidget(QLabel("Preview Diff"))
+        preview_layout.addWidget(self.preview_file_label)
+        preview_layout.addWidget(self.preview_meta_label)
+        preview_layout.addWidget(self.preview_diff_editor)
+        left_col.addWidget(self.preview_dock)
+
+        drawer_layout = QVBoxLayout(self.new_page_drawer)
+        drawer_layout.setContentsMargins(8, 8, 8, 8)
+        drawer_layout.addWidget(QLabel("New Page"))
+        drawer_layout.addWidget(self.new_page_name_input)
+        drawer_layout.addWidget(self.new_page_package_label)
+        drawer_layout.addWidget(self.new_page_target_label)
+        drawer_layout.addWidget(self.new_page_preview_editor)
+        drawer_actions = QHBoxLayout()
+        drawer_actions.addWidget(self.new_page_apply_button)
+        drawer_actions.addWidget(self.new_page_cancel_button)
+        drawer_actions.addStretch(1)
+        drawer_layout.addLayout(drawer_actions)
         left_col.addStretch(1)
-        left_scroll.setWidget(left_content)
-        left_card_layout.addWidget(left_scroll)
+        self.left_panel = LeftPanel(left_content)
+        self.left_panel.setFixedWidth(400)
 
-        details_card = QFrame()
-        details_card.setObjectName("Card")
-        right_col = QVBoxLayout(details_card)
-        details_title = QLabel("Clicked Element Details")
-        details_title.setObjectName("SectionTitle")
-        right_col.addWidget(details_title)
-        right_col.addLayout(detail_form)
-        right_col.addWidget(QLabel("Score breakdown:"))
-        right_col.addWidget(self.breakdown_text)
-        right_col.addLayout(feedback_row)
-        right_col.addStretch(1)
+        self.browser_panel = BrowserPanel()
+        self.browser_panel.inspect_capture.connect(self._on_embedded_click_capture)
+        self.browser_panel.inspect_hover_probe.connect(self._on_embedded_hover_probe)
+        self.browser_panel.page_changed.connect(self._on_embedded_page_changed)
+        self.browser_panel.load_finished.connect(self._on_embedded_load_finished)
+        self.browser_panel.set_show_clickable_target_outline(self.show_clickable_target_outline_checkbox.isChecked())
 
-        content_layout = QHBoxLayout()
-        content_layout.addWidget(left_card, 3)
-        content_layout.addWidget(details_card, 2)
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter.addWidget(self.left_panel)
+        self.workspace_splitter.addWidget(self.browser_panel)
+        self.workspace_splitter.setChildrenCollapsible(True)
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setSizes([400, 1060])
 
-        self.status_label = QLabel("Ready. Step 1: enter URL and launch browser.")
+        self.status_label = QLabel("Ready. Step 1: select project/module/page and launch URL.")
         self.status_label.setObjectName("Status")
         self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        bottom_bar = BottomStatusBar(
+            status_label=self.bottom_status_label,
+            warning_label=self.bottom_warning_label,
+            result_label=self.bottom_result_label,
+        )
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
-        root_layout.addWidget(header_card)
-        root_layout.addWidget(controls_card)
-        root_layout.addLayout(content_layout)
+        root_layout.addWidget(top_bar)
+        root_layout.addWidget(self.workspace_splitter, 1)
+        root_layout.addWidget(bottom_bar)
         root_layout.addWidget(self.status_label)
-
         self.setCentralWidget(root)
 
         self.toast_label = QLabel("", self)
@@ -511,12 +1107,19 @@ class MainWindow(QMainWindow):
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self.toast_label.hide)
 
+        self.action_search_timer = QTimer(self)
+        self.action_search_timer.setSingleShot(True)
+        self.action_search_timer.setInterval(160)
+        self.action_search_timer.timeout.connect(self._refresh_action_dropdown)
+        self.action_search_input.textChanged.disconnect()
+        self.action_search_input.textChanged.connect(lambda _text: self.action_search_timer.start())
+
         self._apply_style()
         self._refresh_table_root_section()
         self._refresh_parameter_panel()
         self._update_generated_methods_preview()
-        if not self._ensure_context_selected(initial=True):
-            QTimer.singleShot(0, self.close)
+        self._load_workspace_from_config()
+        self._update_workspace_actions_state()
 
     def _fit_window_to_screen(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -543,7 +1146,7 @@ class MainWindow(QMainWindow):
             """
             QWidget {
                 color: #0f172a;
-                font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+                font-family: "Helvetica Neue", Arial, sans-serif;
                 font-size: 13px;
             }
             QMainWindow {
@@ -620,19 +1223,23 @@ class MainWindow(QMainWindow):
             }
             QTableWidget {
                 gridline-color: #94a3b8;
-                selection-background-color: #dbeafe;
+                selection-background-color: #eef2ff;
                 selection-color: #0f172a;
             }
             QTableWidget::item:selected {
-                background: #dbeafe;
+                background: #eef2ff;
                 color: #0f172a;
             }
             QTableWidget::item:selected:active {
-                background: #bfdbfe;
+                background: #e2e8ff;
                 color: #0f172a;
             }
             QTableWidget::item:selected:!active {
-                background: #dbeafe;
+                background: #eef2ff;
+                color: #0f172a;
+            }
+            QTableWidget::item:hover {
+                background: transparent;
                 color: #0f172a;
             }
             QWidget#LocatorCell {
@@ -826,6 +1433,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         layout.addWidget(hint)
         layout.addLayout(row)
+        layout.addWidget(self.table_root_choice_combo)
         layout.addWidget(self.table_root_warning_label)
         self.table_root_warning_label.setVisible(False)
         self.table_root_section.setVisible(False)
@@ -877,6 +1485,24 @@ class MainWindow(QMainWindow):
     def _on_show_advanced_toggled(self, enabled: bool) -> None:
         self.show_advanced_actions = bool(enabled)
         self._refresh_action_dropdown()
+
+    def _on_show_advanced_locators_toggled(self, enabled: bool) -> None:
+        self.show_advanced_locators = bool(enabled)
+        self._refresh_candidate_list_view()
+
+    def _refresh_candidate_list_view(self) -> None:
+        if not self.current_candidates:
+            self.current_visible_candidates = []
+            self._render_candidates([])
+            return
+
+        if self.show_advanced_locators:
+            visible = self.current_candidates[:15]
+        else:
+            valid = [candidate for candidate in self.current_candidates if bool(candidate.metadata.get("display_valid", True))]
+            visible = valid[:8]
+        self.current_visible_candidates = visible
+        self._render_candidates(self.current_visible_candidates)
 
     def _set_category_filter(self, category: str) -> None:
         if category not in CATEGORY_FILTERS:
@@ -999,6 +1625,7 @@ class MainWindow(QMainWindow):
         needs_table = has_table_actions(self.selected_actions)
         self.table_root_section.setVisible(needs_table)
         self.table_root_warning_label.setVisible(False)
+        self.table_root_choice_combo.setVisible(False)
         if not needs_table:
             return
 
@@ -1012,6 +1639,34 @@ class MainWindow(QMainWindow):
         if warning:
             self.table_root_warning_label.setText(warning)
             self.table_root_warning_label.setVisible(True)
+            self.bottom_warning_label.setText(warning)
+
+        if len(self.auto_table_root_candidates) > 1 and not self.manual_table_root_selector_type:
+            self.table_root_choice_combo.blockSignals(True)
+            self.table_root_choice_combo.clear()
+            for index, candidate in enumerate(self.auto_table_root_candidates, start=1):
+                selector_type = candidate.get("selector_type", "?")
+                selector_value = candidate.get("selector_value", "?")
+                reason = candidate.get("reason", "-")
+                label = f"{index}. {selector_type}: {selector_value} ({reason})"
+                self.table_root_choice_combo.addItem(label, candidate)
+            self.table_root_choice_combo.setCurrentIndex(0)
+            self.table_root_choice_combo.blockSignals(False)
+            self.table_root_choice_combo.setVisible(True)
+
+    def _on_table_root_choice_changed(self, _index: int) -> None:
+        selected_candidate = self.table_root_choice_combo.currentData()
+        if not isinstance(selected_candidate, dict):
+            return
+        selector_type = selected_candidate.get("selector_type")
+        selector_value = selected_candidate.get("selector_value")
+        if selector_type and selector_value:
+            self.auto_table_root_selector_type = selector_type
+            self.auto_table_root_selector_value = selector_value
+            self.auto_table_root_locator_name = selected_candidate.get("locator_name_hint") or self._selected_table_root_locator_name()
+            self.auto_table_root_warning = selected_candidate.get("warning", "").strip() or None
+            self._refresh_table_root_section()
+            self._update_generated_methods_preview()
 
     def _refresh_parameter_panel(self) -> None:
         required = set(required_parameter_keys(self.selected_actions))
@@ -1093,10 +1748,6 @@ class MainWindow(QMainWindow):
             return
 
         selected_candidate = candidates[0]
-        if len(candidates) > 1:
-            selected = self._choose_table_root_candidate(candidates)
-            if selected:
-                selected_candidate = selected
 
         selector_type = selected_candidate.get("selector_type")
         selector_value = selected_candidate.get("selector_value")
@@ -1136,28 +1787,6 @@ class MainWindow(QMainWindow):
         self._set_status("Manual table root override cleared.")
         self._refresh_table_root_section()
         self._update_generated_methods_preview()
-
-    def _choose_table_root_candidate(self, candidates: list[dict[str, str]]) -> dict[str, str] | None:
-        labels: list[str] = []
-        lookup: dict[str, dict[str, str]] = {}
-        for index, candidate in enumerate(candidates, start=1):
-            selector_type = candidate.get("selector_type", "?")
-            selector_value = candidate.get("selector_value", "?")
-            reason = candidate.get("reason", "-")
-            label = f"{index}. {selector_type}: {selector_value} ({reason})"
-            labels.append(label)
-            lookup[label] = candidate
-        selected_label, ok = QInputDialog.getItem(
-            self,
-            "Select Table Root",
-            "Multiple table roots detected. Select one:",
-            labels,
-            0,
-            False,
-        )
-        if not ok:
-            return None
-        return lookup.get(selected_label)
 
     def _start_table_root_pick_mode(self) -> None:
         self.pick_table_root_mode = True
@@ -1257,34 +1886,7 @@ class MainWindow(QMainWindow):
         self.payload_status_label.setText(user_message)
         self._show_toast(user_message)
 
-    def _change_context(self) -> None:
-        if self._ensure_context_selected(initial=False):
-            return
-        self._set_status("Context change canceled.")
-
-    def _ensure_context_selected(self, initial: bool) -> bool:
-        wizard = ContextWizardDialog(
-            self,
-            initial_project_root=self.project_root,
-            initial_module_name=self.selected_module.name if self.selected_module else None,
-        )
-        if wizard.exec() != QDialog.DialogCode.Accepted:
-            if initial:
-                self._set_status("Context selection canceled. Reopen app to continue.")
-            return False
-
-        selection = wizard.selected_context
-        if not selection:
-            if initial:
-                self._set_status("Context selection did not return a valid value.")
-            return False
-
-        self._apply_context(selection)
-        return True
-
-    def _apply_context(self, selection: ContextSelection) -> None:
-        self.project_root = selection.project_root
-        self.selected_module = selection.module
+    def _reset_context_dependent_state(self) -> None:
         self.manual_table_root_selector_type = None
         self.manual_table_root_selector_value = None
         self.manual_table_root_locator_name = None
@@ -1294,19 +1896,106 @@ class MainWindow(QMainWindow):
         self.auto_table_root_locator_name = None
         self.auto_table_root_warning = None
         self.auto_table_root_candidates = []
-        self._refresh_page_classes()
 
-        root_text = str(selection.project_root)
-        display_root = root_text if len(root_text) <= 56 else f"...{root_text[-53:]}"
-        self.context_value_label.setText(f"Project: {display_root} | Module: {selection.module.name}")
-        self.context_value_label.setToolTip(f"Project: {selection.project_root}\nModule: {selection.module.name}")
-
-        if self.discovered_pages:
-            self._set_status(
-                f"Context loaded: {selection.module.name} ({len(self.discovered_pages)} page class(es) found)."
-            )
+    def _browse_project_root(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Select Automation Project Root")
+        if not chosen:
             return
-        self._set_status(f"Context loaded: {selection.module.name}. No page classes found.")
+        self.project_input.setText(chosen)
+        self._on_project_root_edited()
+
+    def _on_project_root_edited(self) -> None:
+        raw = self.project_input.text().strip()
+        root = Path(raw) if raw else None
+        if not root or not root.is_dir():
+            self.project_root = None
+            self.available_modules = []
+            self.module_combo.clear()
+            self.module_combo.addItem("Select module", None)
+            self.selected_module = None
+            self._refresh_page_classes()
+            self._set_status("Select a valid automation project root.")
+            self._persist_workspace_config()
+            return
+
+        self.project_root = root
+        self._refresh_modules()
+        self._persist_workspace_config()
+
+    def _refresh_modules(self) -> None:
+        if not self.project_root:
+            self.available_modules = []
+            self.module_combo.clear()
+            self.module_combo.addItem("Select module", None)
+            return
+
+        modules = discover_modules(self.project_root)
+        self.available_modules = modules
+        self.module_combo.blockSignals(True)
+        self.module_combo.clear()
+        self.module_combo.addItem("Select module", None)
+        for module in modules:
+            self.module_combo.addItem(module.name, module)
+        self.module_combo.blockSignals(False)
+
+        if not modules:
+            self.selected_module = None
+            self._refresh_page_classes()
+            self._set_status("No modules found under <root>/modules/apps.")
+            return
+
+        self._set_status(f"Loaded {len(modules)} module(s).")
+
+    def _on_module_changed(self, _index: int) -> None:
+        selected = self.module_combo.currentData()
+        if isinstance(selected, ModuleInfo):
+            self.selected_module = selected
+            self._reset_context_dependent_state()
+            self._refresh_page_classes()
+            self._persist_workspace_config()
+            return
+
+        self.selected_module = None
+        self._reset_context_dependent_state()
+        self._refresh_page_classes()
+        self._persist_workspace_config()
+
+    def _load_workspace_from_config(self) -> None:
+        config = load_workspace_config(self.workspace_config_path)
+        if config.url:
+            self.url_input.setText(config.url)
+        if config.project_root:
+            self.project_input.setText(config.project_root)
+            self._on_project_root_edited()
+
+        if config.module_name and self.available_modules:
+            for index in range(self.module_combo.count()):
+                data = self.module_combo.itemData(index)
+                if isinstance(data, ModuleInfo) and data.name == config.module_name:
+                    self.module_combo.setCurrentIndex(index)
+                    break
+
+        if config.page_class:
+            self._select_page_class(config.page_class)
+
+        self.inspect_toggle.setChecked(False)
+        self.inspect_toggle.setText("Inspect Mode: OFF")
+        self.inspect_toggle.setEnabled(can_enable_inspect(has_launched_page=False))
+        if config.inspect_enabled:
+            self.bottom_warning_label.setText("Inspect mode preference loaded. Launch URL, then enable Inspect.")
+
+    def _persist_workspace_config(self) -> None:
+        config = WorkspaceConfig(
+            project_root=str(self.project_root) if self.project_root else self.project_input.text().strip(),
+            module_name=self.selected_module.name if self.selected_module else "",
+            page_class=self._selected_page_class().class_name if self._selected_page_class() else "",
+            url=self.url_input.text().strip() or "https://example.com",
+            inspect_enabled=self.inspect_toggle.isChecked(),
+        )
+        try:
+            save_workspace_config(self.workspace_config_path, config)
+        except OSError:
+            return
 
     def _refresh_page_classes(self) -> None:
         self._reset_generated_preview_override()
@@ -1317,6 +2006,7 @@ class MainWindow(QMainWindow):
         if not self.selected_module:
             self.discovered_pages = []
             self.page_combo.setEnabled(False)
+            self.new_page_button.setEnabled(False)
             self._update_add_button_state()
             return
 
@@ -1325,11 +2015,12 @@ class MainWindow(QMainWindow):
         for page in pages:
             self.page_combo.addItem(page.class_name, page)
 
-        can_create_page = bool(self.selected_module.pages_source_root)
-        if can_create_page:
-            self.page_combo.addItem("+ Create New Page...", CREATE_NEW_PAGE_OPTION)
-
+        can_create_page = can_enable_new_page(
+            has_project_root=bool(self.project_root),
+            has_module=self.selected_module is not None,
+        )
         self.page_combo.setEnabled(can_create_page)
+        self.new_page_button.setEnabled(can_create_page)
         if pages:
             self.page_combo.setCurrentIndex(1)
             self.page_combo_previous_index = 1
@@ -1337,6 +2028,11 @@ class MainWindow(QMainWindow):
             self.page_combo.setCurrentIndex(0)
             self.page_combo_previous_index = 0
         self._update_add_button_state()
+        self._persist_workspace_config()
+        if self.selected_module and pages:
+            self._set_status(f"Context loaded: {self.selected_module.name} ({len(pages)} page class(es) found).")
+        elif self.selected_module:
+            self._set_status(f"Context loaded: {self.selected_module.name}. No page classes found.")
 
     def _selected_page_class(self) -> PageClassInfo | None:
         selected = self.page_combo.currentData()
@@ -1345,75 +2041,82 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_page_combo_changed(self, _index: int) -> None:
-        selected = self.page_combo.currentData()
-        if selected == CREATE_NEW_PAGE_OPTION:
-            self._create_new_page_flow()
-            return
         self.page_combo_previous_index = self.page_combo.currentIndex()
+        self._persist_workspace_config()
         self._update_add_button_state()
 
-    def _create_new_page_flow(self) -> None:
+    def _select_page_class(self, class_name: str) -> None:
+        for index in range(self.page_combo.count()):
+            data = self.page_combo.itemData(index)
+            if isinstance(data, PageClassInfo) and data.class_name == class_name:
+                self.page_combo.setCurrentIndex(index)
+                self.page_combo_previous_index = index
+                return
+
+    def _toggle_new_page_drawer(self) -> None:
+        self.logger.info("New Page handler invoked.")
         if not self.selected_module:
             self._set_status("Select module before creating page.")
-            self._restore_page_combo_selection()
             return
+        visible = not self.new_page_drawer.isVisible()
+        self.new_page_drawer.setVisible(visible)
+        if visible:
+            self.new_page_name_input.setFocus()
+            self._preview_new_page_inline()
+        else:
+            self._cancel_new_page_inline()
 
-        page_name, ok = QInputDialog.getText(
-            self,
-            "Create New Page",
-            "Page Name (PascalCase):",
-        )
-        if not ok:
-            self._set_status("Cancelled — no page created.")
-            self._restore_page_combo_selection()
+    def _preview_new_page_inline(self) -> None:
+        if not self.selected_module:
+            self.pending_page_creation_preview = None
+            self.new_page_apply_button.setEnabled(False)
             return
 
         preview = generate_page_creation_preview(
             module=self.selected_module,
             existing_pages=self.discovered_pages,
-            page_name_raw=page_name,
+            page_name_raw=self.new_page_name_input.text(),
         )
-        if not preview.ok:
-            self._set_status(preview.message)
-            self._show_toast(preview.message)
-            self._restore_page_combo_selection()
+        self.pending_page_creation_preview = preview
+        if preview.package_name:
+            self.new_page_package_label.setText(f"Package: {preview.package_name}")
+        else:
+            self.new_page_package_label.setText("Package: -")
+        self.new_page_target_label.setText(f"Target: {preview.target_file}")
+        self.new_page_preview_editor.setPlainText(preview.file_content or preview.message)
+        self.new_page_apply_button.setEnabled(preview.ok)
+        if not preview.ok and self.new_page_name_input.text().strip():
+            self.bottom_warning_label.setText(preview.message)
+
+    def _apply_new_page_inline(self) -> None:
+        preview = self.pending_page_creation_preview
+        if not preview or not preview.ok:
+            self._set_status("No page creation preview to apply.")
             return
-
-        self._show_page_creation_preview(preview)
-
-    def _show_page_creation_preview(self, preview: PageCreationPreview) -> None:
-        preview_dialog = DiffPreviewDialog(
-            target_file=preview.target_file,
-            final_locator_name=None,
-            method_names=[],
-            method_signatures=[],
-            diff_text=preview.diff_text,
-            summary_message=preview.message,
-            parent=self,
-        )
-        if preview_dialog.exec() != QDialog.DialogCode.Accepted:
-            self._set_status("Cancelled — no changes.")
-            self._show_toast("Cancelled — no changes.")
-            self._restore_page_combo_selection()
-            return
-
         applied, message = apply_page_creation_preview(preview)
         self._set_status(message)
         self._show_toast(message)
+        self.bottom_result_label.setText(message)
         if not applied:
-            self._restore_page_combo_selection()
             return
 
-        created_class_name = preview.class_name
+        created_class_name = preview.class_name or ""
+        self.new_page_drawer.setVisible(False)
+        self.new_page_name_input.clear()
+        self.pending_page_creation_preview = None
         self._refresh_page_classes()
         if created_class_name:
-            for index in range(self.page_combo.count()):
-                data = self.page_combo.itemData(index)
-                if isinstance(data, PageClassInfo) and data.class_name == created_class_name:
-                    self.page_combo.setCurrentIndex(index)
-                    self.page_combo_previous_index = index
-                    break
+            self._select_page_class(created_class_name)
         self._update_add_button_state()
+
+    def _cancel_new_page_inline(self) -> None:
+        self.pending_page_creation_preview = None
+        self.new_page_name_input.clear()
+        self.new_page_preview_editor.clear()
+        self.new_page_package_label.setText("Package: -")
+        self.new_page_target_label.setText("Target: -")
+        self.new_page_apply_button.setEnabled(False)
+        self.new_page_drawer.setVisible(False)
 
     def _restore_page_combo_selection(self) -> None:
         target_index = self.page_combo_previous_index
@@ -1429,12 +2132,63 @@ class MainWindow(QMainWindow):
         has_page = self._selected_page_class() is not None
         has_locator = self._selected_candidate() is not None
         has_name = bool(self.element_name_input.text().strip())
-        self.add_button.setEnabled(has_page and has_locator and has_name)
-        self.validate_button.setEnabled(has_page and has_locator and has_name)
+        validation_ok = self._validate_current_request() is None
+        state = compute_enable_state(
+            has_page=has_page,
+            has_locator=has_locator,
+            has_element_name=has_name,
+            validation_ok=validation_ok,
+            has_preview=self.pending_java_preview is not None,
+        )
+        self.add_button.setEnabled(state.can_preview)
+        self.left_add_button.setEnabled(state.can_preview)
+        self.validate_button.setEnabled(state.can_preview)
+        self.apply_preview_button.setEnabled(state.can_apply)
+        self.left_apply_preview_button.setEnabled(state.can_apply)
+        self.cancel_preview_button.setEnabled(state.can_cancel_preview)
+        self.left_cancel_preview_button.setEnabled(state.can_cancel_preview)
         if not (has_page and has_locator and has_name):
-            self.payload_status_label.setText("Waiting for page, locator, and element name.")
+            missing: list[str] = []
+            if not has_page:
+                missing.append("page")
+            if not has_locator:
+                missing.append("locator")
+            if not has_name:
+                missing.append("element name")
+            self.payload_status_label.setText(f"Waiting for: {', '.join(missing)}.")
         else:
             self._refresh_payload_status("Payload ready. Click Add to prepare output.")
+        self._update_workspace_actions_state()
+
+    def _update_workspace_actions_state(self) -> None:
+        has_page = self._selected_page_class() is not None
+        has_locator = self._selected_candidate() is not None
+        has_name = bool(self.element_name_input.text().strip())
+        has_actions = bool(self._selected_actions())
+        has_base_context = has_page and has_locator and has_name
+        ready_for_strict_validation = has_base_context and has_actions
+        validation_error = self._validate_current_request()
+        if not ready_for_strict_validation and self.pending_java_preview is None:
+            self.top_status_pill.setText("OK")
+            self.top_status_pill.setStyleSheet("background:#dcfce7;color:#166534;padding:3px 8px;border-radius:10px;")
+            if self.bottom_warning_label.text().startswith("Table root") or self.bottom_warning_label.text().startswith(
+                "Select "
+            ):
+                self.bottom_warning_label.clear()
+            return
+        if validation_error:
+            self.top_status_pill.setText("Error")
+            self.top_status_pill.setStyleSheet("background:#fee2e2;color:#991b1b;padding:3px 8px;border-radius:10px;")
+            self.bottom_warning_label.setText(validation_error)
+        elif self.pending_java_preview is not None:
+            self.top_status_pill.setText("Preview")
+            self.top_status_pill.setStyleSheet("background:#dbeafe;color:#1d4ed8;padding:3px 8px;border-radius:10px;")
+            self.bottom_warning_label.setText("Preview ready. Click Apply to write or Cancel Preview.")
+        else:
+            self.top_status_pill.setText("OK")
+            self.top_status_pill.setStyleSheet("background:#dcfce7;color:#166534;padding:3px 8px;border-radius:10px;")
+            if self.bottom_warning_label.text().startswith("Table root"):
+                self.bottom_warning_label.clear()
 
     def _selected_actions(self) -> list[str]:
         return list(self.selected_actions)
@@ -1463,12 +2217,24 @@ class MainWindow(QMainWindow):
 
     def _prepare_add_request(self) -> None:
         try:
+            self.logger.info(
+                "Add->Preview requested: page=%s locator_selected=%s element_name=%s actions=%s",
+                self._selected_page_class().class_name if self._selected_page_class() else "-",
+                bool(self._selected_candidate()),
+                self.element_name_input.text().strip() or "-",
+                ",".join(self._selected_actions()) or "-",
+            )
             preview = self._generate_preview_for_current_request()
             if not preview.ok:
                 self.pending_java_preview = None
+                self.preview_dock.setVisible(False)
                 self._set_status(preview.message)
                 self.payload_status_label.setText(preview.message)
+                self.bottom_warning_label.setText(preview.message)
+                self.bottom_result_label.setText("")
+                self.logger.warning("Preview not generated: %s", preview.message)
                 self._show_toast(preview.message)
+                self._update_add_button_state()
                 return
 
             self.pending_java_preview = preview
@@ -1478,34 +2244,16 @@ class MainWindow(QMainWindow):
             self.preview_signatures_override = list(preview.added_method_signatures)
             self.preview_signatures_actions_snapshot = tuple(self._selected_actions())
             self._update_generated_methods_preview()
-
-            preview_dialog = DiffPreviewDialog(
-                target_file=preview.target_file,
-                final_locator_name=preview.final_locator_name,
-                method_names=list(preview.added_methods),
-                method_signatures=list(preview.added_method_signatures),
-                diff_text=preview.diff_text,
-                summary_message=preview.message,
-                parent=self,
-            )
-            if preview_dialog.exec() != QDialog.DialogCode.Accepted:
-                self.pending_java_preview = None
-                self._set_status("Cancelled — no changes.")
-                self.payload_status_label.setText("Cancelled — no changes.")
-                self._show_toast("Cancelled — no changes.")
-                self._update_generated_methods_preview()
-                return
-
-            applied, message, _backup_path = apply_java_preview(preview)
-            self.pending_java_preview = None
-            self._set_status(message)
-            self.payload_status_label.setText(message)
-            self._show_toast(message)
-            self._update_generated_methods_preview()
+            self._populate_preview_dock(preview)
+            self.bottom_result_label.setText(preview.message)
+            self.bottom_warning_label.setText("Preview ready. Click Apply to write or Cancel Preview.")
+            self.logger.info("Preview generated: target=%s methods=%s", preview.target_file, ",".join(preview.added_methods) or "-")
+            self._update_add_button_state()
             return
         except Exception as exc:
             self.pending_java_preview = None
             self._handle_ui_exception("Unexpected error during preview/apply. See ~/.inspectelement/ui.log.", exc)
+            self._update_add_button_state()
 
     def _validate_only_request(self) -> None:
         try:
@@ -1518,8 +2266,66 @@ class MainWindow(QMainWindow):
             self._set_status("Validation successful. Preview can be generated and applied safely.")
             self.payload_status_label.setText("Validation successful. No files written.")
             self._show_toast("Validation successful")
+            self.bottom_result_label.setText("Validation successful. No files written.")
+            self._update_workspace_actions_state()
         except Exception as exc:
             self._handle_ui_exception("Validation failed unexpectedly. See ~/.inspectelement/ui.log.", exc)
+
+    def _populate_preview_dock(self, preview: JavaPreview) -> None:
+        methods = ", ".join(preview.added_methods) if preview.added_methods else "-"
+        locator = preview.final_locator_name or "-"
+        self.preview_file_label.setText(f"Target file: {preview.target_file}")
+        self.preview_meta_label.setText(f"Locator: {locator} | Methods: {methods}")
+        self.preview_diff_editor.setPlainText(preview.diff_text)
+        self.preview_dock.setVisible(True)
+
+    def _apply_pending_preview(self) -> None:
+        preview = self.pending_java_preview
+        if not preview:
+            self._set_status("No preview to apply.")
+            return
+        self.logger.info("Apply requested: target=%s", preview.target_file)
+        validation_error = self._validate_current_request()
+        if validation_error:
+            self._set_status(validation_error)
+            self.bottom_warning_label.setText(validation_error)
+            self._show_toast(validation_error)
+            self._update_add_button_state()
+            return
+
+        applied, message, backup_path = apply_java_preview(preview)
+        self.logger.info("Apply result: applied=%s message=%s backup=%s", applied, message, backup_path or "-")
+        self._set_status(message)
+        self.payload_status_label.setText(message)
+        self.bottom_result_label.setText(message)
+        if not applied:
+            self.bottom_warning_label.setText(message)
+        if backup_path:
+            self.bottom_result_label.setText(f"{message} | backup={backup_path}")
+        self._show_toast(message)
+        if applied:
+            self.pending_java_preview = None
+            self.preview_dock.setVisible(False)
+            self.preview_diff_editor.clear()
+            self.preview_file_label.setText("Target file: -")
+            self.preview_meta_label.setText("Preview not generated.")
+            self.bottom_warning_label.clear()
+        self._update_add_button_state()
+        self._persist_workspace_config()
+
+    def _cancel_preview(self) -> None:
+        self.pending_java_preview = None
+        self.preview_dock.setVisible(False)
+        self.preview_diff_editor.clear()
+        self.preview_file_label.setText("Target file: -")
+        self.preview_meta_label.setText("Preview cancelled.")
+        self.preview_locator_name_override = None
+        self.preview_signatures_override = None
+        self.preview_signatures_actions_snapshot = ()
+        self._set_status("Cancelled — no changes.")
+        self.payload_status_label.setText("Cancelled — no changes.")
+        self.bottom_result_label.setText("Cancelled — no changes.")
+        self._update_add_button_state()
 
     def _generate_preview_for_current_request(self) -> JavaPreview:
         validation_error = self._validate_current_request()
@@ -1630,13 +2436,88 @@ class MainWindow(QMainWindow):
         suggestion = suggest_element_name(self.current_summary, fallback=fallback)
         self.element_name_input.setText(suggestion)
 
+    @staticmethod
+    def _normalize_launch_url(raw_url: str) -> str:
+        url = raw_url.strip()
+        if not url:
+            return ""
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            return f"https://{url}"
+        return url
+
     def _launch(self) -> None:
-        self.browser.launch(self.url_input.text())
+        launch_url = self._normalize_launch_url(self.url_input.text())
+        if not launch_url:
+            self._set_status("Please enter a URL.")
+            return
+        self.url_input.setText(launch_url)
+        if not self.browser_panel.webview:
+            self._set_status("Embedded browser is unavailable in this runtime.")
+            self.bottom_warning_label.setText("Qt WebEngine is required for embedded inspect mode.")
+            return
+        self.inspect_toggle.setChecked(False)
+        self.inspect_toggle.setText("Inspect Mode: OFF")
+        self.inspect_toggle.setEnabled(can_enable_inspect(has_launched_page=False))
+        self.browser_panel.set_inspector_enabled(False)
+        self._set_focus_mode(False)
+        self.browser_panel.load_url(launch_url)
+        self._ensure_browser_worker_started()
+        self.browser.launch(launch_url, viewport=self.browser_panel.viewport_size())
+        self.open_managed_inspector_button.setEnabled(False)
+        self._set_status(f"Launching: {launch_url}")
+        self.bottom_result_label.setText("Embedded + managed browser launch requested.")
+        self._persist_workspace_config()
 
     def _toggle_inspect(self) -> None:
         enabled = self.inspect_toggle.isChecked()
+        self.logger.info("Inspect toggle changed: enabled=%s", enabled)
         self.inspect_toggle.setText(f"Inspect Mode: {'ON' if enabled else 'OFF'}")
         self.browser.set_inspect_mode(enabled)
+        if self.browser_panel.webview:
+            self.browser_panel.set_inspector_enabled(enabled)
+        if enabled:
+            self._set_status("Inspect ON. Click element in embedded browser to capture coordinates.")
+        self._set_focus_mode(enabled)
+        self._persist_workspace_config()
+
+    def _on_show_clickable_outline_toggled(self, enabled: bool) -> None:
+        self.browser_panel.set_show_clickable_target_outline(enabled)
+
+    def _toggle_left_panel(self) -> None:
+        visible = self.left_panel.isVisible()
+        self.left_panel.setVisible(not visible)
+        self.toggle_left_panel_button.setText("Show Panel" if visible else "Hide Panel")
+        if visible:
+            self.workspace_splitter.setSizes([0, max(600, self.width())])
+        else:
+            self.workspace_splitter.setSizes([400, max(600, self.width() - 400)])
+
+    def _set_focus_mode(self, enabled: bool) -> None:
+        hide_when_focus = [
+            self.score_breakdown_label,
+            self.breakdown_text,
+            self.feedback_row_container,
+            self.apply_edit_button,
+            self.copy_edited_button,
+            self.good_edited_button,
+        ]
+        for widget in hide_when_focus:
+            widget.setVisible(not enabled)
+        if enabled:
+            self.results_table.setMaximumHeight(360)
+        else:
+            self.results_table.setMaximumHeight(245)
+
+    def _open_managed_inspector(self) -> None:
+        self._ensure_browser_worker_started()
+        self.browser.open_managed_inspector()
+
+    def _ensure_browser_worker_started(self) -> None:
+        if self._browser_worker_started:
+            return
+        self.browser.start()
+        self._browser_worker_started = True
 
     def _copy(self, value: str) -> None:
         QApplication.clipboard().setText(value)
@@ -1644,16 +2525,17 @@ class MainWindow(QMainWindow):
         self._show_toast("Panoya kopyalandi")
 
     def _copy_best(self) -> None:
-        if not self.current_candidates:
+        source_candidates = self.current_visible_candidates or self.current_candidates
+        if not source_candidates:
             self._set_status("No locator candidates yet.")
             return
 
         selected_format = self.output_format_combo.currentText()
         if selected_format == "Best":
-            self._copy(self.current_candidates[0].locator)
+            self._copy(source_candidates[0].locator)
             return
 
-        for candidate in self.current_candidates:
+        for candidate in source_candidates:
             if candidate.locator_type == selected_format:
                 self._copy(candidate.locator)
                 return
@@ -1716,7 +2598,7 @@ class MainWindow(QMainWindow):
             return
         row = selected[0].row()
         candidate.locator = edited
-        self._render_candidates(self.current_candidates)
+        self._refresh_candidate_list_view()
         if 0 <= row < self.results_table.rowCount():
             self.results_table.selectRow(row)
         self._set_status("Edited locator applied.")
@@ -1730,9 +2612,112 @@ class MainWindow(QMainWindow):
             return
         self._copy(edited)
 
+    def _on_embedded_click_capture(self, payload: dict) -> None:
+        if not self.inspect_toggle.isChecked():
+            return
+        try:
+            x = float(payload.get("x", 0))
+            y = float(payload.get("y", 0))
+            viewport_width = int(payload.get("viewport_width", 0))
+            viewport_height = int(payload.get("viewport_height", 0))
+            scroll_x = int(payload.get("scroll_x", 0))
+            scroll_y = int(payload.get("scroll_y", 0))
+            source_dpr = float(payload.get("device_pixel_ratio", 1.0))
+        except (TypeError, ValueError):
+            self._set_status("Invalid inspect capture payload received.")
+            self.logger.warning("Invalid inspect payload received: %s", payload)
+            return
+
+        try:
+            self.logger.info(
+                "Embedded inspect click received: x=%s y=%s viewport=%sx%s scroll=%s,%s dpr=%.2f",
+                int(x),
+                int(y),
+                viewport_width,
+                viewport_height,
+                scroll_x,
+                scroll_y,
+                source_dpr,
+            )
+            click_url = str(payload.get("url", "") or "").strip()
+            self.browser.capture_at_coordinates(
+                x,
+                y,
+                viewport=(max(1, viewport_width), max(1, viewport_height)),
+                scroll=(max(0, scroll_x), max(0, scroll_y)),
+                source_url=click_url or None,
+                source_dpr=source_dpr,
+            )
+            self._set_status(f"Capture requested at ({int(x)}, {int(y)}).")
+        except Exception as exc:
+            self.logger.exception("Embedded inspect click dispatch failed", exc_info=exc)
+            self._set_status(f"Capture dispatch failed: {exc}")
+
+    def _on_embedded_hover_probe(self, payload: dict) -> None:
+        if not self.inspect_toggle.isChecked():
+            return
+        try:
+            x = float(payload.get("x", 0))
+            y = float(payload.get("y", 0))
+            viewport_width = int(payload.get("viewport_width", 0))
+            viewport_height = int(payload.get("viewport_height", 0))
+            scroll_x = int(payload.get("scroll_x", 0))
+            scroll_y = int(payload.get("scroll_y", 0))
+            source_dpr = float(payload.get("device_pixel_ratio", 1.0))
+        except (TypeError, ValueError):
+            return
+
+        hover_url = str(payload.get("url", "") or "").strip()
+        self.browser.probe_hover_at_coordinates(
+            x,
+            y,
+            viewport=(max(1, viewport_width), max(1, viewport_height)),
+            scroll=(max(0, scroll_x), max(0, scroll_y)),
+            source_url=hover_url or None,
+            source_dpr=source_dpr,
+        )
+
+    def _on_hover_box_changed(self, rect: object) -> None:
+        if not self.inspect_toggle.isChecked():
+            self.browser_panel.apply_hover_box(None)
+            return
+        if isinstance(rect, dict):
+            raw = rect.get("raw")
+            refined = rect.get("refined")
+            self.last_hover_raw_target = self._normalize_target_dict(raw)
+            self.last_hover_refined_target = self._normalize_target_dict(refined)
+            self._refresh_target_summary_labels()
+            self.browser_panel.apply_hover_box(rect)
+            return
+        self.last_hover_raw_target = None
+        self.last_hover_refined_target = None
+        self._refresh_target_summary_labels()
+        self.browser_panel.apply_hover_box(None)
+
+    def _on_embedded_load_finished(self, ok: bool) -> None:
+        if not ok:
+            self.bottom_warning_label.setText("Embedded page failed to load.")
+            return
+        self.inspect_toggle.setEnabled(can_enable_inspect(has_launched_page=True))
+        self.open_managed_inspector_button.setEnabled(True)
+        self.browser.sync_viewport(self.browser_panel.viewport_size())
+        if self.inspect_toggle.isChecked() and self.browser_panel.webview:
+            self.browser_panel.set_inspector_enabled(True)
+
     def _on_capture(self, summary: ElementSummary, candidates: list[LocatorCandidate]) -> None:
         self._reset_generated_preview_override()
         self.current_summary = summary
+        if summary.raw_target:
+            self.last_hover_raw_target = summary.raw_target
+        if summary.refined_target:
+            self.last_hover_refined_target = summary.refined_target
+        self.logger.info(
+            "Capture received: tag=%s id=%s text=%s candidates=%s",
+            summary.tag or "-",
+            summary.id or "-",
+            (summary.text or "-")[:120],
+            len(candidates),
+        )
         self._set_auto_table_root_from_summary(summary)
         scoring_failed = False
         try:
@@ -1744,9 +2729,9 @@ class MainWindow(QMainWindow):
 
         self.current_candidates = ranked_candidates
         self._render_summary(summary)
-        self._render_candidates(self.current_candidates)
-        if self.pick_table_root_mode and self.current_candidates:
-            root_selector = self._resolve_java_selector(self.current_candidates[0])
+        self._refresh_candidate_list_view()
+        if self.pick_table_root_mode and self.current_visible_candidates:
+            root_selector = self._resolve_java_selector(self.current_visible_candidates[0])
             if root_selector:
                 locator_name_hint = None
                 if summary.table_root:
@@ -1764,17 +2749,33 @@ class MainWindow(QMainWindow):
                 self._set_status("Picked element locator type is unsupported for table root.")
                 self._show_toast("Unsupported table root locator")
             self.pick_table_root_mode = False
-        if self.current_candidates:
-            self._suggest_element_name(self.current_candidates[0], force=True)
+        if self.current_visible_candidates:
+            self._suggest_element_name(self.current_visible_candidates[0], force=True)
         else:
             self.element_name_input.clear()
         self._update_add_button_state()
-        status_message = f"Captured <{summary.tag}> with {len(self.current_candidates)} suggestions."
+        status_message = f"Captured <{summary.tag}> with {len(self.current_visible_candidates)} suggestions."
+        if not self.current_visible_candidates and self.current_candidates:
+            status_message += " Enable 'Show advanced locators' to inspect non-validated fallbacks."
         if scoring_failed:
             status_message += " Recommendation scoring failed; using base order."
         self._set_status(status_message)
 
-    def _on_page_changed(self, title: str, url: str) -> None:
+    def _on_embedded_page_changed(self, title: str, url: str) -> None:
+        self.setWindowTitle(f"inspectelement - {title or url}")
+        if url and self.url_input.text().strip() != url:
+            self.url_input.blockSignals(True)
+            self.url_input.setText(url)
+            self.url_input.blockSignals(False)
+            self._persist_workspace_config()
+        if url:
+            self.inspect_toggle.setEnabled(can_enable_inspect(has_launched_page=True))
+            self.open_managed_inspector_button.setEnabled(True)
+            self.browser.navigate(url)
+
+    def _on_managed_page_changed(self, title: str, url: str) -> None:
+        if not url:
+            return
         self.setWindowTitle(f"inspectelement - {title or url}")
 
     def _set_status(self, message: str) -> None:
@@ -1806,11 +2807,58 @@ class MainWindow(QMainWindow):
             "text": summary.text or "-",
             "placeholder": summary.placeholder or "-",
             "aria-label": summary.aria_label or "-",
+            "raw-target": self._format_target_summary(summary.raw_target or self.last_hover_raw_target),
+            "refined-target": self._format_target_summary(summary.refined_target or self.last_hover_refined_target),
         }
         for key, label in self.detail_labels.items():
             label.setText(mapping.get(key, "-"))
 
+    def _normalize_target_dict(self, raw: object) -> dict[str, str] | None:
+        if not isinstance(raw, dict):
+            return None
+        tag = str(raw.get("tag", "") or "").strip().lower()
+        element_id = str(raw.get("id", "") or "").strip()
+        class_name = str(raw.get("class_name", "") or "").strip()
+        text = str(raw.get("text", "") or "").strip()
+        if not any((tag, element_id, class_name, text)):
+            return None
+        return {
+            "tag": tag,
+            "id": element_id,
+            "class_name": class_name,
+            "text": text,
+        }
+
+    def _format_target_summary(self, target: dict[str, str] | None) -> str:
+        if not target:
+            return "-"
+        tag = target.get("tag", "").strip() or "?"
+        element_id = target.get("id", "").strip()
+        class_name = target.get("class_name", "").strip()
+        text = target.get("text", "").strip()
+        pieces = [tag]
+        if element_id:
+            pieces.append(f"#{element_id}")
+        if class_name:
+            first_class = class_name.split()[0]
+            if first_class:
+                pieces.append(f".{first_class}")
+        if text:
+            pieces.append(f"'{text[:50]}'")
+        return " ".join(pieces)
+
+    def _refresh_target_summary_labels(self) -> None:
+        if "raw-target" in self.detail_labels:
+            self.detail_labels["raw-target"].setText(
+                self._format_target_summary(self.last_hover_raw_target)
+            )
+        if "refined-target" in self.detail_labels:
+            self.detail_labels["refined-target"].setText(
+                self._format_target_summary(self.last_hover_refined_target)
+            )
+
     def _render_candidates(self, candidates: list[LocatorCandidate]) -> None:
+        previous_row = self.results_table.currentRow()
         self.results_table.setRowCount(len(candidates))
 
         for row, candidate in enumerate(candidates):
@@ -1865,9 +2913,10 @@ class MainWindow(QMainWindow):
         self._update_locator_text_elide()
 
         if candidates:
-            self.results_table.selectRow(0)
-            self._show_breakdown(candidates[0])
-            self.locator_editor.setPlainText(candidates[0].locator)
+            target_row = previous_row if 0 <= previous_row < len(candidates) else 0
+            self.results_table.selectRow(target_row)
+            self._show_breakdown(candidates[target_row])
+            self.locator_editor.setPlainText(candidates[target_row].locator)
         else:
             self.breakdown_text.clear()
             self.locator_editor.clear()
@@ -1897,9 +2946,9 @@ class MainWindow(QMainWindow):
         if not selected:
             return None
         row = selected[0].row()
-        if row < 0 or row >= len(self.current_candidates):
+        if row < 0 or row >= len(self.current_visible_candidates):
             return None
-        return self.current_candidates[row]
+        return self.current_visible_candidates[row]
 
     def _on_selection_changed(self) -> None:
         candidate = self._selected_candidate()
@@ -1953,3 +3002,7 @@ class MainWindow(QMainWindow):
         if self.toast_label.isVisible():
             self._position_toast()
         super().resizeEvent(event)
+
+
+# Backward-compatible alias used by __main__.py and older imports.
+MainWindow = WorkspaceWindow

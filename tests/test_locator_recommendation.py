@@ -42,3 +42,15 @@ def test_recommendation_penalizes_dynamic_id_vs_name_selector() -> None:
 
     assert ordered[0].locator == 'input[name="email"]'
     assert ordered[1].metadata["write_recommendation_label"] in {"Risky", ""}
+
+
+def test_recommendation_prefers_id_and_aria_over_wrapper_xpath() -> None:
+    candidates = [
+        _candidate("XPath", "//*[@id='modals']//div[normalize-space(.)='Yemek']", rule="xpath_ancestor_context", uniqueness_count=1),
+        _candidate("Selenium", 'By.ID("menu-item-yemek")', rule="stable_attr:id", uniqueness_count=1),
+        _candidate("CSS", 'a[aria-label="Yemek"]', rule="attr:role", uniqueness_count=1),
+    ]
+
+    ordered = recommend_locator_candidates(candidates)
+    assert ordered[0].locator in {'By.ID("menu-item-yemek")', 'a[aria-label="Yemek"]'}
+    assert ordered[-1].locator == "//*[@id='modals']//div[normalize-space(.)='Yemek']"
