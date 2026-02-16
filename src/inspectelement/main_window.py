@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
 import sys
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QGuiApplication, QIcon
+from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,7 +32,11 @@ from PySide6.QtWidgets import (
 
 from .browser_manager import BrowserManager
 from .context_wizard import ContextSelection, ContextWizardDialog
+from .diff_preview_dialog import DiffPreviewDialog
+from .java_pom_writer import JavaPreview, apply_java_preview, generate_java_preview
+from .locator_recommendation import recommend_locator_candidates
 from .models import ElementSummary, LocatorCandidate
+from .name_suggester import suggest_element_name
 from .project_discovery import ModuleInfo, PageClassInfo, discover_page_classes
 
 
@@ -44,6 +49,7 @@ class EventBridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.logger = self._build_logger()
         self.setWindowTitle("inspectelement")
         self._fit_window_to_screen()
         self._set_icon()
@@ -65,6 +71,7 @@ class MainWindow(QMainWindow):
         self.project_root: Path | None = None
         self.selected_module: ModuleInfo | None = None
         self.discovered_pages: list[PageClassInfo] = []
+        self.pending_java_preview: JavaPreview | None = None
 
         self.url_input = QLineEdit("https://example.com")
         self.url_input.setPlaceholderText("https://your-app-url")
@@ -116,6 +123,11 @@ class MainWindow(QMainWindow):
         self.click_action_checkbox.toggled.connect(self._on_action_selection_changed)
         self.sendkeys_action_checkbox.toggled.connect(self._on_action_selection_changed)
 
+        self.log_language_combo = QComboBox()
+        self.log_language_combo.addItems(["TR", "EN"])
+        self.log_language_combo.setCurrentText("TR")
+        self.log_language_combo.currentTextChanged.connect(self._on_action_selection_changed)
+
         self.add_button = QPushButton("Add")
         self.add_button.setEnabled(False)
         self.add_button.clicked.connect(self._prepare_add_request)
@@ -124,8 +136,8 @@ class MainWindow(QMainWindow):
         self.payload_status_label.setObjectName("Muted")
         self.payload_status_label.setWordWrap(True)
 
-        self.results_table = QTableWidget(0, 4)
-        self.results_table.setHorizontalHeaderLabels(["Rank", "Type", "Locator", "Score"])
+        self.results_table = QTableWidget(0, 5)
+        self.results_table.setHorizontalHeaderLabels(["Rank", "Type", "Locator", "Score", "Guidance"])
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -140,9 +152,11 @@ class MainWindow(QMainWindow):
         self.results_table.horizontalHeader().setSectionResizeMode(1, self.results_table.horizontalHeader().ResizeMode.Fixed)
         self.results_table.horizontalHeader().setSectionResizeMode(2, self.results_table.horizontalHeader().ResizeMode.Stretch)
         self.results_table.horizontalHeader().setSectionResizeMode(3, self.results_table.horizontalHeader().ResizeMode.Fixed)
+        self.results_table.horizontalHeader().setSectionResizeMode(4, self.results_table.horizontalHeader().ResizeMode.Fixed)
         self.results_table.setColumnWidth(0, 70)
         self.results_table.setColumnWidth(1, 110)
         self.results_table.setColumnWidth(3, 96)
+        self.results_table.setColumnWidth(4, 120)
         self.results_table.verticalHeader().setDefaultSectionSize(36)
         self.results_table.setMinimumHeight(225)
         self.results_table.setMaximumHeight(245)
@@ -274,6 +288,9 @@ class MainWindow(QMainWindow):
         action_row.addWidget(QLabel("Actions:"))
         action_row.addWidget(self.click_action_checkbox)
         action_row.addWidget(self.sendkeys_action_checkbox)
+        action_row.addSpacing(12)
+        action_row.addWidget(QLabel("Log:"))
+        action_row.addWidget(self.log_language_combo)
         action_row.addStretch(1)
         action_row.addWidget(self.add_button)
         left_col.addLayout(action_row)
@@ -494,6 +511,33 @@ class MainWindow(QMainWindow):
         version = sys.version.split()[0]
         return f"Runtime: {sys.executable} (Python {version})"
 
+    @staticmethod
+    def _build_logger() -> logging.Logger:
+        logger = logging.getLogger("inspectelement.ui")
+        if logger.handlers:
+            return logger
+
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        try:
+            log_dir = Path.home() / ".inspectelement"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_dir / "ui.log", encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(file_handler)
+        except Exception:
+            # Fallback to stderr logging if file logger cannot be initialized.
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(stream_handler)
+        return logger
+
+    def _handle_ui_exception(self, user_message: str, exc: Exception) -> None:
+        self.logger.exception("%s: %s", user_message, exc)
+        self._set_status(user_message)
+        self.payload_status_label.setText(user_message)
+        self._show_toast(user_message)
+
     def _change_context(self) -> None:
         if self._ensure_context_selected(initial=False):
             return
@@ -594,111 +638,114 @@ class MainWindow(QMainWindow):
 
         actions = self._selected_actions()
         action_text = ", ".join(actions) if actions else "none"
+        log_language = self.log_language_combo.currentText()
         self.payload_status_label.setText(
-            f"{prefix}: {page.class_name} | {name} | {candidate.locator_type} | actions={action_text}"
+            f"{prefix}: {page.class_name} | {name} | {candidate.locator_type} | "
+            f"actions={action_text} | log={log_language}"
         )
 
     def _prepare_add_request(self) -> None:
-        page = self._selected_page_class()
-        candidate = self._selected_candidate()
-        element_name = self.element_name_input.text().strip()
-        if not page or not candidate or not element_name:
-            self._set_status("Select page, locator, and element name before Add.")
-            self._show_toast("Add icin zorunlu alanlar eksik")
-            self._update_add_button_state()
+        try:
+            page = self._selected_page_class()
+            candidate = self._selected_candidate()
+            element_name = self.element_name_input.text().strip()
+            if not page or not candidate or not element_name:
+                self._set_status("Select page, locator, and element name before Add.")
+                self._show_toast("Add icin zorunlu alanlar eksik")
+                self._update_add_button_state()
+                return
+
+            actions = self._selected_actions()
+            selector_details = self._resolve_java_selector(candidate)
+            if not selector_details:
+                self._set_status("Selected locator type cannot be written to Java. Choose CSS/XPath/Selenium.")
+                self.payload_status_label.setText("Selected locator type cannot be written to Java.")
+                self._show_toast("Desteklenmeyen locator tipi")
+                return
+
+            selector_type, selector_value = selector_details
+            preview = generate_java_preview(
+                target_file=page.file_path,
+                locator_name=element_name,
+                selector_type=selector_type,
+                selector_value=selector_value,
+                actions=actions,
+                log_language=self.log_language_combo.currentText(),
+            )
+            if not preview.ok:
+                self.pending_java_preview = None
+                self._set_status(preview.message)
+                self.payload_status_label.setText(preview.message)
+                self._show_toast(preview.message)
+                return
+
+            self.pending_java_preview = preview
+            self._set_status(preview.message)
+            self.payload_status_label.setText(preview.message)
+
+            preview_dialog = DiffPreviewDialog(
+                target_file=preview.target_file,
+                final_locator_name=preview.final_locator_name,
+                method_names=list(preview.added_methods),
+                diff_text=preview.diff_text,
+                summary_message=preview.message,
+                parent=self,
+            )
+            if preview_dialog.exec() != QDialog.DialogCode.Accepted:
+                self.pending_java_preview = None
+                self._set_status("Cancelled — no changes.")
+                self.payload_status_label.setText("Cancelled — no changes.")
+                self._show_toast("Cancelled — no changes.")
+                return
+
+            applied, message, _backup_path = apply_java_preview(preview)
+            self.pending_java_preview = None
+            self._set_status(message)
+            self.payload_status_label.setText(message)
+            self._show_toast(message)
             return
+        except Exception as exc:
+            self.pending_java_preview = None
+            self._handle_ui_exception("Unexpected error during preview/apply. See ~/.inspectelement/ui.log.", exc)
 
-        actions = self._selected_actions()
+    def _resolve_java_selector(self, candidate: LocatorCandidate) -> tuple[str, str] | None:
+        locator_type = candidate.locator_type
+        if locator_type == "CSS":
+            return "css", candidate.locator
+        if locator_type == "XPath":
+            return "xpath", candidate.locator
 
-        action_text = ", ".join(actions) if actions else "none"
-        self._set_status(
-            f"Add payload prepared -> Page: {page.class_name}, Name: {element_name}, "
-            f"Locator: {candidate.locator_type}, Actions: {action_text}. "
-            "Java write flow will be added in Sprint 3."
-        )
-        self.payload_status_label.setText("Payload prepared (no file written)")
-        self._show_toast("Payload hazir (Sprint 3'te apply)")
+        if locator_type == "Selenium":
+            selector_kind = candidate.metadata.get("selector_kind")
+            selector_value = candidate.metadata.get("selector_value")
+            if isinstance(selector_kind, str) and isinstance(selector_value, str):
+                normalized = selector_kind.lower()
+                if normalized in {"css", "xpath", "id", "name"}:
+                    return normalized, selector_value
+
+            by_pattern = re.search(r'By\\.([A-Z_]+)\\(\"(.*)\"\\)', candidate.locator)
+            if not by_pattern:
+                return None
+            mapping = {
+                "CSS_SELECTOR": "css",
+                "XPATH": "xpath",
+                "ID": "id",
+                "NAME": "name",
+            }
+            selector = mapping.get(by_pattern.group(1))
+            if not selector:
+                return None
+            return selector, by_pattern.group(2)
+
+        return None
 
     def _suggest_element_name(self, candidate: LocatorCandidate | None, force: bool = False) -> None:
         if not force and self.element_name_input.text().strip():
             return
 
-        suggestion_base = self._to_constant_name(self._preferred_name_source(candidate))
-        suffix = self._element_name_suffix()
-        suggestion = (
-            suggestion_base
-            if suggestion_base.endswith(f"_{suffix}")
-            else f"{suggestion_base}_{suffix}"
-        )
+        fallback = candidate.locator if candidate else None
+        suggestion = suggest_element_name(self.current_summary, fallback=fallback)
         self.element_name_input.setText(suggestion)
-
-    def _preferred_name_source(self, candidate: LocatorCandidate | None) -> str:
-        if self.current_summary:
-            summary_values = (
-                self.current_summary.text,
-                self.current_summary.aria_label,
-                self.current_summary.placeholder,
-                self.current_summary.name,
-                self.current_summary.id,
-            )
-            for value in summary_values:
-                if value and value.strip():
-                    return value
-
-        if candidate and candidate.locator:
-            return candidate.locator
-        return "ELEMENT"
-
-    def _element_name_suffix(self) -> str:
-        if not self.current_summary:
-            return "TXT"
-
-        tag = (self.current_summary.tag or "").strip().lower()
-        role = (self.current_summary.role or "").strip().lower()
-        input_type = (self.current_summary.attributes.get("type", "") if self.current_summary.attributes else "").lower()
-
-        if tag == "button" or role == "button":
-            return "BTN"
-        if tag == "input" and input_type in {"button", "submit", "reset"}:
-            return "BTN"
-        if tag == "a":
-            return "LNK"
-        return "TXT"
-
-    @staticmethod
-    def _normalize_turkish_text(value: str) -> str:
-        translation_table = str.maketrans(
-            {
-                "ç": "c",
-                "Ç": "C",
-                "ğ": "g",
-                "Ğ": "G",
-                "ı": "i",
-                "İ": "I",
-                "ö": "o",
-                "Ö": "O",
-                "ş": "s",
-                "Ş": "S",
-                "ü": "u",
-                "Ü": "U",
-            }
-        )
-        return value.translate(translation_table)
-
-    @staticmethod
-    def _to_constant_name(value: str) -> str:
-        normalized_value = MainWindow._normalize_turkish_text(value)
-        fragments = [fragment for fragment in re.split(r"[^A-Za-z0-9]+", normalized_value) if fragment]
-        if not fragments:
-            return "ELEMENT"
-
-        normalized = "_".join(part.upper() for part in fragments[:4])
-        normalized = re.sub(r"_+", "_", normalized).strip("_")
-        if not normalized:
-            return "ELEMENT"
-        if normalized[0].isdigit():
-            return f"E_{normalized}"
-        return normalized
 
     def _launch(self) -> None:
         self.browser.launch(self.url_input.text())
@@ -802,15 +849,26 @@ class MainWindow(QMainWindow):
 
     def _on_capture(self, summary: ElementSummary, candidates: list[LocatorCandidate]) -> None:
         self.current_summary = summary
-        self.current_candidates = candidates
+        scoring_failed = False
+        try:
+            ranked_candidates = recommend_locator_candidates(candidates)
+        except Exception as exc:
+            self.logger.exception("Failed to score locator recommendations", exc_info=exc)
+            ranked_candidates = candidates
+            scoring_failed = True
+
+        self.current_candidates = ranked_candidates
         self._render_summary(summary)
-        self._render_candidates(candidates)
-        if candidates:
-            self._suggest_element_name(candidates[0], force=True)
+        self._render_candidates(self.current_candidates)
+        if self.current_candidates:
+            self._suggest_element_name(self.current_candidates[0], force=True)
         else:
             self.element_name_input.clear()
         self._update_add_button_state()
-        self._set_status(f"Captured <{summary.tag}> with {len(candidates)} suggestions.")
+        status_message = f"Captured <{summary.tag}> with {len(self.current_candidates)} suggestions."
+        if scoring_failed:
+            status_message += " Recommendation scoring failed; using base order."
+        self._set_status(status_message)
 
     def _on_page_changed(self, title: str, url: str) -> None:
         self.setWindowTitle(f"inspectelement - {title or url}")
@@ -854,14 +912,25 @@ class MainWindow(QMainWindow):
         for row, candidate in enumerate(candidates):
             rank_item = QTableWidgetItem(str(row + 1))
             type_item = QTableWidgetItem(candidate.locator_type)
-            score_item = QTableWidgetItem(f"{candidate.score:.2f}")
+            recommendation_score = candidate.metadata.get("write_recommendation_score", candidate.score)
+            score_value = float(recommendation_score) if isinstance(recommendation_score, (int, float)) else candidate.score
+            score_item = QTableWidgetItem(f"{score_value:.1f}")
+            guidance_text = str(candidate.metadata.get("write_recommendation_label", "")).strip() or "-"
+            guidance_item = QTableWidgetItem(guidance_text)
             rank_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             score_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            guidance_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             self.results_table.setItem(row, 0, rank_item)
             self.results_table.setItem(row, 1, type_item)
             self.results_table.setItem(row, 3, score_item)
+            self.results_table.setItem(row, 4, guidance_item)
+
+            if guidance_text == "Recommended":
+                guidance_item.setForeground(QColor("#166534"))
+            elif guidance_text == "Risky":
+                guidance_item.setForeground(QColor("#b91c1c"))
 
             locator_cell = QWidget()
             locator_cell.setObjectName("LocatorCell")
@@ -950,6 +1019,16 @@ class MainWindow(QMainWindow):
             f"Learning adjustment: {breakdown.learning_adjustment:+.2f}",
             f"Total: {breakdown.total:+.2f}",
         ]
+        recommendation_score = candidate.metadata.get("write_recommendation_score")
+        recommendation_label = candidate.metadata.get("write_recommendation_label")
+        if isinstance(recommendation_score, (int, float)):
+            lines.append(f"Write recommendation score: {float(recommendation_score):.1f}")
+        if isinstance(recommendation_label, str) and recommendation_label:
+            lines.append(f"Write recommendation label: {recommendation_label}")
+
+        reasons = candidate.metadata.get("write_recommendation_reasons")
+        if isinstance(reasons, list) and reasons:
+            lines.append(f"Write recommendation reasons: {', '.join(str(reason) for reason in reasons)}")
         if candidate.metadata:
             for key in ("depth", "nth_count", "depth_penalty", "nth_penalty", "is_override"):
                 if key in candidate.metadata:
