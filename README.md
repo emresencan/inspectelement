@@ -76,6 +76,26 @@ Or with console script:
 inspectelement
 ```
 
+## Doctor Checks
+
+Verify interpreter and import path before running:
+
+```bash
+which python
+python -c "import sys; print(sys.executable)"
+python -c "import importlib; print(importlib.import_module('inspectelement.main_window').__file__)"
+python -c "import importlib; print(importlib.import_module('inspectelement.context_wizard').__file__)"
+```
+
+Windows PowerShell:
+
+```powershell
+Get-Command python
+python -c "import sys; print(sys.executable)"
+python -c "import importlib; print(importlib.import_module('inspectelement.main_window').__file__)"
+python -c "import importlib; print(importlib.import_module('inspectelement.context_wizard').__file__)"
+```
+
 ## Troubleshooting
 
 - Missing Chromium/browser executable errors:

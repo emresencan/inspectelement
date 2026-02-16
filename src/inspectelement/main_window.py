@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import sys
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -17,6 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -25,7 +30,9 @@ from PySide6.QtWidgets import (
 )
 
 from .browser_manager import BrowserManager
+from .context_wizard import ContextSelection, ContextWizardDialog
 from .models import ElementSummary, LocatorCandidate
+from .project_discovery import ModuleInfo, PageClassInfo, discover_page_classes
 
 
 class EventBridge(QObject):
@@ -55,6 +62,9 @@ class MainWindow(QMainWindow):
 
         self.current_summary: ElementSummary | None = None
         self.current_candidates: list[LocatorCandidate] = []
+        self.project_root: Path | None = None
+        self.selected_module: ModuleInfo | None = None
+        self.discovered_pages: list[PageClassInfo] = []
 
         self.url_input = QLineEdit("https://example.com")
         self.url_input.setPlaceholderText("https://your-app-url")
@@ -80,6 +90,39 @@ class MainWindow(QMainWindow):
         self.clear_overrides_button.clicked.connect(self._clear_overrides)
         self.exit_button = QPushButton("Exit")
         self.exit_button.clicked.connect(self.close)
+
+        self.context_value_label = QLabel("Project: - | Module: -")
+        self.context_value_label.setObjectName("Muted")
+        self.context_value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.change_context_button = QPushButton("Change")
+        self.change_context_button.clicked.connect(self._change_context)
+
+        self.page_combo = QComboBox()
+        self.page_combo.addItem("Select page class", None)
+        self.page_combo.setEnabled(False)
+        self.page_combo.currentIndexChanged.connect(self._update_add_button_state)
+
+        self.runtime_info_label = QLabel(self._runtime_summary())
+        self.runtime_info_label.setObjectName("Muted")
+        self.runtime_info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.runtime_info_label.setToolTip(f"Python executable: {sys.executable}\nPython version: {sys.version}")
+
+        self.element_name_input = QLineEdit()
+        self.element_name_input.setPlaceholderText("Element name (e.g. KURAL_ADI_TXT)")
+        self.element_name_input.textChanged.connect(self._update_add_button_state)
+
+        self.click_action_checkbox = QCheckBox("click")
+        self.sendkeys_action_checkbox = QCheckBox("sendKeys")
+        self.click_action_checkbox.toggled.connect(self._on_action_selection_changed)
+        self.sendkeys_action_checkbox.toggled.connect(self._on_action_selection_changed)
+
+        self.add_button = QPushButton("Add")
+        self.add_button.setEnabled(False)
+        self.add_button.clicked.connect(self._prepare_add_request)
+
+        self.payload_status_label = QLabel("Waiting for page, locator, and element name.")
+        self.payload_status_label.setObjectName("Muted")
+        self.payload_status_label.setWordWrap(True)
 
         self.results_table = QTableWidget(0, 4)
         self.results_table.setHorizontalHeaderLabels(["Rank", "Type", "Locator", "Score"])
@@ -183,6 +226,10 @@ class MainWindow(QMainWindow):
         url_label.setObjectName("FieldLabel")
         format_label = QLabel("Copy Format")
         format_label.setObjectName("FieldLabel")
+        context_label = QLabel("Context")
+        context_label.setObjectName("FieldLabel")
+        page_label = QLabel("Page Class")
+        page_label.setObjectName("FieldLabel")
 
         controls_layout.addWidget(url_label, 0, 0)
         controls_layout.addWidget(self.url_input, 0, 1, 1, 5)
@@ -194,10 +241,22 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.reset_learning_button, 1, 5)
         controls_layout.addWidget(self.clear_overrides_button, 1, 6)
         controls_layout.addWidget(self.exit_button, 1, 7)
+        controls_layout.addWidget(context_label, 2, 0)
+        controls_layout.addWidget(self.context_value_label, 2, 1, 1, 6)
+        controls_layout.addWidget(self.change_context_button, 2, 7)
+        controls_layout.addWidget(page_label, 3, 0)
+        controls_layout.addWidget(self.page_combo, 3, 1, 1, 3)
+        controls_layout.addWidget(self.runtime_info_label, 4, 0, 1, 8)
 
         left_card = QFrame()
         left_card.setObjectName("Card")
-        left_col = QVBoxLayout(left_card)
+        left_card_layout = QVBoxLayout(left_card)
+        left_card_layout.setContentsMargins(0, 0, 0, 0)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_content = QWidget()
+        left_col = QVBoxLayout(left_content)
         left_title = QLabel("Locator Suggestions")
         left_title.setObjectName("SectionTitle")
         left_hint = QLabel("After clicking an element in Inspect Mode, top 5 locator candidates appear below.")
@@ -208,6 +267,20 @@ class MainWindow(QMainWindow):
         left_col.addWidget(QLabel("Locator Editor:"))
         left_col.addWidget(self.locator_editor)
         left_col.addLayout(editor_actions_row)
+        left_col.addWidget(QLabel("Element Name:"))
+        left_col.addWidget(self.element_name_input)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(QLabel("Actions:"))
+        action_row.addWidget(self.click_action_checkbox)
+        action_row.addWidget(self.sendkeys_action_checkbox)
+        action_row.addStretch(1)
+        action_row.addWidget(self.add_button)
+        left_col.addLayout(action_row)
+        left_col.addWidget(self.payload_status_label)
+        left_col.addStretch(1)
+        left_scroll.setWidget(left_content)
+        left_card_layout.addWidget(left_scroll)
 
         details_card = QFrame()
         details_card.setObjectName("Card")
@@ -248,6 +321,8 @@ class MainWindow(QMainWindow):
         self._toast_timer.timeout.connect(self.toast_label.hide)
 
         self._apply_style()
+        if not self._ensure_context_selected(initial=True):
+            QTimer.singleShot(0, self.close)
 
     def _fit_window_to_screen(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -369,6 +444,13 @@ class MainWindow(QMainWindow):
             QWidget#LocatorCell {
                 background: transparent;
             }
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
             QComboBox {
                 padding-right: 24px;
             }
@@ -406,6 +488,217 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+    @staticmethod
+    def _runtime_summary() -> str:
+        version = sys.version.split()[0]
+        return f"Runtime: {sys.executable} (Python {version})"
+
+    def _change_context(self) -> None:
+        if self._ensure_context_selected(initial=False):
+            return
+        self._set_status("Context change canceled.")
+
+    def _ensure_context_selected(self, initial: bool) -> bool:
+        wizard = ContextWizardDialog(
+            self,
+            initial_project_root=self.project_root,
+            initial_module_name=self.selected_module.name if self.selected_module else None,
+        )
+        if wizard.exec() != QDialog.DialogCode.Accepted:
+            if initial:
+                self._set_status("Context selection canceled. Reopen app to continue.")
+            return False
+
+        selection = wizard.selected_context
+        if not selection:
+            if initial:
+                self._set_status("Context selection did not return a valid value.")
+            return False
+
+        self._apply_context(selection)
+        return True
+
+    def _apply_context(self, selection: ContextSelection) -> None:
+        self.project_root = selection.project_root
+        self.selected_module = selection.module
+        self._refresh_page_classes()
+
+        root_text = str(selection.project_root)
+        display_root = root_text if len(root_text) <= 56 else f"...{root_text[-53:]}"
+        self.context_value_label.setText(f"Project: {display_root} | Module: {selection.module.name}")
+        self.context_value_label.setToolTip(f"Project: {selection.project_root}\nModule: {selection.module.name}")
+
+        if self.discovered_pages:
+            self._set_status(
+                f"Context loaded: {selection.module.name} ({len(self.discovered_pages)} page class(es) found)."
+            )
+            return
+        self._set_status(f"Context loaded: {selection.module.name}. No page classes found.")
+
+    def _refresh_page_classes(self) -> None:
+        self.page_combo.clear()
+        self.page_combo.addItem("Select page class", None)
+
+        if not self.selected_module:
+            self.discovered_pages = []
+            self.page_combo.setEnabled(False)
+            self._update_add_button_state()
+            return
+
+        pages = discover_page_classes(self.selected_module)
+        self.discovered_pages = pages
+        for page in pages:
+            self.page_combo.addItem(page.class_name, page)
+
+        has_pages = bool(pages)
+        self.page_combo.setEnabled(has_pages)
+        if has_pages:
+            self.page_combo.setCurrentIndex(1)
+        self._update_add_button_state()
+
+    def _selected_page_class(self) -> PageClassInfo | None:
+        selected = self.page_combo.currentData()
+        if isinstance(selected, PageClassInfo):
+            return selected
+        return None
+
+    def _update_add_button_state(self) -> None:
+        has_page = self._selected_page_class() is not None
+        has_locator = self._selected_candidate() is not None
+        has_name = bool(self.element_name_input.text().strip())
+        self.add_button.setEnabled(has_page and has_locator and has_name)
+        if not (has_page and has_locator and has_name):
+            self.payload_status_label.setText("Waiting for page, locator, and element name.")
+        else:
+            self._refresh_payload_status("Payload ready. Click Add to prepare output.")
+
+    def _selected_actions(self) -> list[str]:
+        actions: list[str] = []
+        if self.click_action_checkbox.isChecked():
+            actions.append("click")
+        if self.sendkeys_action_checkbox.isChecked():
+            actions.append("sendKeys")
+        return actions
+
+    def _on_action_selection_changed(self) -> None:
+        self._refresh_payload_status()
+
+    def _refresh_payload_status(self, prefix: str = "Payload preview") -> None:
+        page = self._selected_page_class()
+        candidate = self._selected_candidate()
+        name = self.element_name_input.text().strip()
+        if not page or not candidate or not name:
+            self.payload_status_label.setText("Waiting for page, locator, and element name.")
+            return
+
+        actions = self._selected_actions()
+        action_text = ", ".join(actions) if actions else "none"
+        self.payload_status_label.setText(
+            f"{prefix}: {page.class_name} | {name} | {candidate.locator_type} | actions={action_text}"
+        )
+
+    def _prepare_add_request(self) -> None:
+        page = self._selected_page_class()
+        candidate = self._selected_candidate()
+        element_name = self.element_name_input.text().strip()
+        if not page or not candidate or not element_name:
+            self._set_status("Select page, locator, and element name before Add.")
+            self._show_toast("Add icin zorunlu alanlar eksik")
+            self._update_add_button_state()
+            return
+
+        actions = self._selected_actions()
+
+        action_text = ", ".join(actions) if actions else "none"
+        self._set_status(
+            f"Add payload prepared -> Page: {page.class_name}, Name: {element_name}, "
+            f"Locator: {candidate.locator_type}, Actions: {action_text}. "
+            "Java write flow will be added in Sprint 3."
+        )
+        self.payload_status_label.setText("Payload prepared (no file written)")
+        self._show_toast("Payload hazir (Sprint 3'te apply)")
+
+    def _suggest_element_name(self, candidate: LocatorCandidate | None, force: bool = False) -> None:
+        if not force and self.element_name_input.text().strip():
+            return
+
+        suggestion_base = self._to_constant_name(self._preferred_name_source(candidate))
+        suffix = self._element_name_suffix()
+        suggestion = (
+            suggestion_base
+            if suggestion_base.endswith(f"_{suffix}")
+            else f"{suggestion_base}_{suffix}"
+        )
+        self.element_name_input.setText(suggestion)
+
+    def _preferred_name_source(self, candidate: LocatorCandidate | None) -> str:
+        if self.current_summary:
+            summary_values = (
+                self.current_summary.text,
+                self.current_summary.aria_label,
+                self.current_summary.placeholder,
+                self.current_summary.name,
+                self.current_summary.id,
+            )
+            for value in summary_values:
+                if value and value.strip():
+                    return value
+
+        if candidate and candidate.locator:
+            return candidate.locator
+        return "ELEMENT"
+
+    def _element_name_suffix(self) -> str:
+        if not self.current_summary:
+            return "TXT"
+
+        tag = (self.current_summary.tag or "").strip().lower()
+        role = (self.current_summary.role or "").strip().lower()
+        input_type = (self.current_summary.attributes.get("type", "") if self.current_summary.attributes else "").lower()
+
+        if tag == "button" or role == "button":
+            return "BTN"
+        if tag == "input" and input_type in {"button", "submit", "reset"}:
+            return "BTN"
+        if tag == "a":
+            return "LNK"
+        return "TXT"
+
+    @staticmethod
+    def _normalize_turkish_text(value: str) -> str:
+        translation_table = str.maketrans(
+            {
+                "ç": "c",
+                "Ç": "C",
+                "ğ": "g",
+                "Ğ": "G",
+                "ı": "i",
+                "İ": "I",
+                "ö": "o",
+                "Ö": "O",
+                "ş": "s",
+                "Ş": "S",
+                "ü": "u",
+                "Ü": "U",
+            }
+        )
+        return value.translate(translation_table)
+
+    @staticmethod
+    def _to_constant_name(value: str) -> str:
+        normalized_value = MainWindow._normalize_turkish_text(value)
+        fragments = [fragment for fragment in re.split(r"[^A-Za-z0-9]+", normalized_value) if fragment]
+        if not fragments:
+            return "ELEMENT"
+
+        normalized = "_".join(part.upper() for part in fragments[:4])
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+        if not normalized:
+            return "ELEMENT"
+        if normalized[0].isdigit():
+            return f"E_{normalized}"
+        return normalized
 
     def _launch(self) -> None:
         self.browser.launch(self.url_input.text())
@@ -512,6 +805,11 @@ class MainWindow(QMainWindow):
         self.current_candidates = candidates
         self._render_summary(summary)
         self._render_candidates(candidates)
+        if candidates:
+            self._suggest_element_name(candidates[0], force=True)
+        else:
+            self.element_name_input.clear()
+        self._update_add_button_state()
         self._set_status(f"Captured <{summary.tag}> with {len(candidates)} suggestions.")
 
     def _on_page_changed(self, title: str, url: str) -> None:
@@ -600,6 +898,7 @@ class MainWindow(QMainWindow):
         else:
             self.breakdown_text.clear()
             self.locator_editor.clear()
+        self._update_add_button_state()
 
     def _locator_text_width(self) -> int:
         column_width = self.results_table.columnWidth(2)
@@ -634,6 +933,7 @@ class MainWindow(QMainWindow):
         if candidate:
             self._show_breakdown(candidate)
             self.locator_editor.setPlainText(candidate.locator)
+        self._update_add_button_state()
 
     def _show_breakdown(self, candidate: LocatorCandidate) -> None:
         if not candidate.breakdown:

@@ -1,6 +1,6 @@
 greenlet==3.3.1
 iniconfig==2.3.0
--e git+https://github.com/emresencan/inspectelement@6a76e2ab5c9f52ee8564405a51ac7499d0146681#egg=inspectelement
+-e git+https://github.com/emresencan/inspectelement.git@85a87bc413e4c439fa78b83b30e3a87782d4e274#egg=inspectelement
 packaging==26.0
 playwright==1.58.0
 pluggy==1.6.0
