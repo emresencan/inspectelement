@@ -9,6 +9,18 @@ import tempfile
 from typing import Sequence
 
 SAFE_PARSE_ERROR = "Could not safely locate class body/markers; no changes applied."
+SUPPORTED_ACTIONS: tuple[str, ...] = (
+    "clickElement",
+    "javaScriptClicker",
+    "getText",
+    "getAttribute",
+    "isElementDisplayed",
+    "isElementEnabled",
+    "scrollToElement",
+    "javaScriptClearAndSetValue",
+    "javaScriptGetInnerText",
+    "javaScriptGetValue",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +31,7 @@ class JavaPatchResult:
     updated_source: str
     final_locator_name: str | None
     added_methods: tuple[str, ...]
+    added_method_signatures: tuple[str, ...]
     notes: tuple[str, ...] = ()
 
 
@@ -30,6 +43,7 @@ class JavaPreview:
     diff_text: str
     final_locator_name: str | None
     added_methods: tuple[str, ...]
+    added_method_signatures: tuple[str, ...]
     original_source: str | None
     updated_source: str | None
     notes: tuple[str, ...] = ()
@@ -54,6 +68,7 @@ def prepare_java_patch(
             updated_source=source,
             final_locator_name=None,
             added_methods=(),
+            added_method_signatures=(),
             notes=(),
         )
 
@@ -70,6 +85,7 @@ def prepare_java_patch(
             updated_source=source,
             final_locator_name=None,
             added_methods=(),
+            added_method_signatures=(),
             notes=(),
         )
 
@@ -94,13 +110,16 @@ def prepare_java_patch(
                 updated_source=source,
                 final_locator_name=None,
                 added_methods=(),
+                added_method_signatures=(),
                 notes=(),
             )
 
     added_methods: list[str] = []
-    actions_normalized = [action for action in actions if action in {"click", "sendKeys"}]
+    added_method_signatures: list[str] = []
+    actions_normalized = _normalize_actions(actions)
     for action in actions_normalized:
         method_name = _resolve_unique_method_name(updated_source, _method_base_name(action, locator_constant))
+        method_signature = _build_method_signature(page_class_name=class_name, action=action, method_name=method_name)
         method_body = _build_method_snippet(
             class_name,
             action,
@@ -117,10 +136,12 @@ def prepare_java_patch(
                 updated_source=source,
                 final_locator_name=None,
                 added_methods=(),
+                added_method_signatures=(),
                 notes=(),
             )
         updated_source = patched
         added_methods.append(method_name)
+        added_method_signatures.append(method_signature)
 
     if updated_source == source:
         if notes:
@@ -134,6 +155,7 @@ def prepare_java_patch(
             updated_source=source,
             final_locator_name=locator_constant,
             added_methods=tuple(added_methods),
+            added_method_signatures=tuple(added_method_signatures),
             notes=tuple(notes),
         )
 
@@ -148,6 +170,7 @@ def prepare_java_patch(
         updated_source=updated_source,
         final_locator_name=locator_constant,
         added_methods=tuple(added_methods),
+        added_method_signatures=tuple(added_method_signatures),
         notes=tuple(notes),
     )
 
@@ -170,6 +193,7 @@ def generate_java_preview(
             diff_text="",
             final_locator_name=None,
             added_methods=(),
+            added_method_signatures=(),
             original_source=None,
             updated_source=None,
             notes=(),
@@ -192,6 +216,7 @@ def generate_java_preview(
             diff_text="",
             final_locator_name=None,
             added_methods=(),
+            added_method_signatures=(),
             original_source=original_source,
             updated_source=None,
             notes=patch.notes,
@@ -205,6 +230,7 @@ def generate_java_preview(
             diff_text="",
             final_locator_name=patch.final_locator_name,
             added_methods=patch.added_methods,
+            added_method_signatures=patch.added_method_signatures,
             original_source=original_source,
             updated_source=original_source,
             notes=patch.notes,
@@ -227,6 +253,7 @@ def generate_java_preview(
         diff_text=diff,
         final_locator_name=patch.final_locator_name,
         added_methods=patch.added_methods,
+        added_method_signatures=patch.added_method_signatures,
         original_source=original_source,
         updated_source=patch.updated_source,
         notes=patch.notes,
@@ -416,7 +443,7 @@ def _resolve_unique_method_name(source: str, desired_name: str) -> str:
 
     suffix = 2
     while True:
-        candidate = f"{desired_name}{suffix}"
+        candidate = f"{desired_name}_{suffix}"
         if not _contains_method(source, candidate):
             return candidate
         suffix += 1
@@ -448,11 +475,74 @@ def _normalize_expression(value: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
+def build_action_method_signature_preview(page_class_name: str, locator_name: str, action: str) -> str | None:
+    normalized_action = _normalize_action_key(action)
+    if normalized_action is None:
+        return None
+    base_name = _method_base_name(normalized_action, locator_name.strip().upper() or "ELEMENT")
+    return _build_method_signature(page_class_name=page_class_name, action=normalized_action, method_name=base_name)
+
+
+def _normalize_actions(actions: Sequence[str]) -> list[str]:
+    ordered: list[str] = []
+    for action in actions:
+        normalized = _normalize_action_key(action)
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    return ordered
+
+
+def _normalize_action_key(action: str) -> str | None:
+    normalized = action.strip()
+    alias_map = {
+        "click": "clickElement",
+        "sendKeys": "javaScriptClearAndSetValue",
+    }
+    mapped = alias_map.get(normalized, normalized)
+    if mapped in SUPPORTED_ACTIONS:
+        return mapped
+    return None
+
+
 def _method_base_name(action: str, locator_name: str) -> str:
     pascal_name = _to_pascal_case(locator_name)
-    if action == "click":
+    if action == "clickElement":
         return f"click{pascal_name}"
-    return f"input{pascal_name}"
+    if action == "javaScriptClicker":
+        return f"jsClick{pascal_name}"
+    if action == "scrollToElement":
+        return f"scrollTo{pascal_name}"
+    if action == "getText":
+        return f"get{pascal_name}Text"
+    if action == "getAttribute":
+        return f"get{pascal_name}Attribute"
+    if action == "isElementDisplayed":
+        return f"is{pascal_name}Displayed"
+    if action == "isElementEnabled":
+        return f"is{pascal_name}Enabled"
+    if action == "javaScriptClearAndSetValue":
+        return f"jsSet{pascal_name}"
+    if action == "javaScriptGetInnerText":
+        return f"jsGet{pascal_name}InnerText"
+    if action == "javaScriptGetValue":
+        return f"jsGet{pascal_name}Value"
+    return f"action{pascal_name}"
+
+
+def _build_method_signature(page_class_name: str, action: str, method_name: str) -> str:
+    if action in {"clickElement", "javaScriptClicker", "scrollToElement"}:
+        return f"public {page_class_name} {method_name}()"
+    if action == "javaScriptClearAndSetValue":
+        return f"public {page_class_name} {method_name}(String value)"
+    if action == "getText":
+        return f"public String {method_name}()"
+    if action == "getAttribute":
+        return f"public String {method_name}(String attribute)"
+    if action in {"javaScriptGetInnerText", "javaScriptGetValue"}:
+        return f"public String {method_name}()"
+    if action in {"isElementDisplayed", "isElementEnabled"}:
+        return f"public boolean {method_name}(int timeoutSeconds)"
+    return f"public {page_class_name} {method_name}()"
 
 
 def _to_pascal_case(value: str) -> str:
@@ -471,45 +561,197 @@ def _build_method_snippet(
 ) -> str:
     label = _locator_human_label(locator_constant)
     label_java = _escape_java_string(label)
-    if action == "click":
-        if log_language == "TR":
-            description = f"{label} alanına tıklanır."
-            log_message = f"{label_java} alanına tıklandı."
-        else:
-            description = f"Clicks {label} element."
-            log_message = f"Clicked {label_java} element."
+    signature = _build_method_signature(page_class_name, action, method_name)
+
+    if action == "clickElement":
+        description = f"{label} alanına tıklanır." if log_language == "TR" else f"Clicks {label} element."
+        log_message = f"{label_java} alanına tıklandı." if log_language == "TR" else f"Clicked {label_java} element."
         return (
             "/**\n"
             f" * {description}\n"
             " *\n"
             " * @return this\n"
             " */\n"
-            f"public {page_class_name} {method_name}() {{\n"
+            f"{signature} {{\n"
             f"    clickElement({locator_constant});\n"
             f"    logPass(\"{log_message}\");\n"
             "    return this;\n"
             "}"
         )
 
-    if log_language == "TR":
-        description = f"{label} alanına değer yazılır."
-        param_line = " * @param value yazılacak değer"
-        log_message = f"{label_java} alanına değer yazıldı: "
-    else:
-        description = f"Types a value into {label} element."
-        param_line = " * @param value value to type"
-        log_message = f"Entered value into {label_java} element: "
+    if action == "javaScriptClicker":
+        description = f"{label} alanına JavaScript ile tıklanır." if log_language == "TR" else (
+            f"Clicks {label} element via JavaScript."
+        )
+        log_message = (
+            f"{label_java} alanına JavaScript ile tıklandı."
+            if log_language == "TR"
+            else f"Clicked {label_java} element via JavaScript."
+        )
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    javaScriptClicker({locator_constant});\n"
+            f"    logPass(\"{log_message}\");\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "scrollToElement":
+        description = f"{label} alanına kaydırılır." if log_language == "TR" else f"Scrolls to {label} element."
+        log_message = f"{label_java} alanına kaydırıldı." if log_language == "TR" else f"Scrolled to {label_java} element."
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    scrollToElement({locator_constant});\n"
+            f"    logPass(\"{log_message}\");\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "javaScriptClearAndSetValue":
+        description = (
+            f"{label} alanı JavaScript ile temizlenip değer yazılır."
+            if log_language == "TR"
+            else f"Clears and sets {label} value via JavaScript."
+        )
+        param_line = " * @param value yazılacak değer" if log_language == "TR" else " * @param value value to set"
+        log_message = (
+            f"{label_java} alanına JavaScript ile değer yazıldı: "
+            if log_language == "TR"
+            else f"Set {label_java} value via JavaScript: "
+        )
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            f"{param_line}\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    javaScriptClearAndSetValue({locator_constant}, value);\n"
+            f"    logPass(\"{log_message}\" + value);\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "getText":
+        description = f"{label} metnini döndürür." if log_language == "TR" else f"Returns text of {label} element."
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            " * @return element text\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    String text = getText({locator_constant});\n"
+            "    return text;\n"
+            "}"
+        )
+
+    if action == "getAttribute":
+        description = f"{label} alanından attribute değeri döndürür." if log_language == "TR" else (
+            f"Returns attribute value from {label} element."
+        )
+        param_line = " * @param attribute attribute adı" if log_language == "TR" else " * @param attribute attribute name"
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            f"{param_line}\n"
+            " * @return attribute value\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    String attr = getAttribute({locator_constant}, attribute);\n"
+            "    return attr;\n"
+            "}"
+        )
+
+    if action == "isElementDisplayed":
+        description = f"{label} alanı görünür mü kontrol eder." if log_language == "TR" else (
+            f"Checks whether {label} element is displayed."
+        )
+        param_line = " * @param timeoutSeconds bekleme süresi (saniye)" if log_language == "TR" else (
+            " * @param timeoutSeconds wait timeout in seconds"
+        )
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            f"{param_line}\n"
+            " * @return true if displayed\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    boolean ok = isElementDisplayed({locator_constant}, timeoutSeconds);\n"
+            "    return ok;\n"
+            "}"
+        )
+
+    if action == "isElementEnabled":
+        description = f"{label} alanı aktif mi kontrol eder." if log_language == "TR" else (
+            f"Checks whether {label} element is enabled."
+        )
+        param_line = " * @param timeoutSeconds bekleme süresi (saniye)" if log_language == "TR" else (
+            " * @param timeoutSeconds wait timeout in seconds"
+        )
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            f"{param_line}\n"
+            " * @return true if enabled\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    boolean ok = isElementEnabled({locator_constant}, timeoutSeconds);\n"
+            "    return ok;\n"
+            "}"
+        )
+
+    if action == "javaScriptGetInnerText":
+        description = f"{label} alanının innerText değerini döndürür." if log_language == "TR" else (
+            f"Returns JavaScript innerText of {label} element."
+        )
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            " * @return innerText value\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    String t = javaScriptGetInnerText({locator_constant});\n"
+            "    return t;\n"
+            "}"
+        )
+
+    if action == "javaScriptGetValue":
+        description = f"{label} alanının value değerini döndürür." if log_language == "TR" else (
+            f"Returns JavaScript value of {label} element."
+        )
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            " * @return value attribute\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    String v = javaScriptGetValue({locator_constant});\n"
+            "    return v;\n"
+            "}"
+        )
 
     return (
         "/**\n"
-        f" * {description}\n"
-        " *\n"
-        f"{param_line}\n"
-        " * @return this\n"
+        f" * No template found for action: {action}\n"
         " */\n"
-        f"public {page_class_name} {method_name}(String value) {{\n"
-        f"    sendKeys({locator_constant}, value);\n"
-        f"    logPass(\"{log_message}\" + value);\n"
+        f"{signature} {{\n"
         "    return this;\n"
         "}"
     )

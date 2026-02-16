@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import re
 
-from inspectelement.java_pom_writer import SAFE_PARSE_ERROR, prepare_java_patch
+import pytest
+
+from inspectelement.java_pom_writer import (
+    SAFE_PARSE_ERROR,
+    build_action_method_signature_preview,
+    prepare_java_patch,
+)
 
 
 def _region_content(source: str, region_name: str) -> str:
@@ -13,6 +19,16 @@ def _region_content(source: str, region_name: str) -> str:
     match = pattern.search(source)
     assert match is not None
     return match.group("content")
+
+
+def _method_block(source: str, method_name: str) -> str:
+    pattern = re.compile(
+        rf"public\s+[A-Za-z_]\w*\s+{re.escape(method_name)}\s*\([^)]*\)\s*\{{(?P<body>.*?)\n\s*\}}",
+        re.DOTALL,
+    )
+    match = pattern.search(source)
+    assert match is not None
+    return match.group("body")
 
 
 def test_marker_insertion_with_constructor_when_markers_missing() -> None:
@@ -135,7 +151,7 @@ def test_duplicate_selector_reuses_existing_constant_and_generates_method() -> N
         locator_name="KAYDET_BTN",
         selector_type="xpath",
         selector_value="//button[normalize-space()='Kaydet']",
-        actions=("click",),
+        actions=("clickElement",),
     )
 
     assert result.ok
@@ -146,7 +162,88 @@ def test_duplicate_selector_reuses_existing_constant_and_generates_method() -> N
     assert "public FolderPage clickExisting()" in result.updated_source
 
 
-def test_action_method_insertion_click_and_sendkeys() -> None:
+@pytest.mark.parametrize(
+    ("action", "signature", "expected_call", "expected_return", "expects_log"),
+    [
+        (
+            "clickElement",
+            "public FolderPage clickTestLocatorBtn()",
+            "clickElement(TEST_LOCATOR_BTN);",
+            "return this;",
+            True,
+        ),
+        (
+            "javaScriptClicker",
+            "public FolderPage jsClickTestLocatorBtn()",
+            "javaScriptClicker(TEST_LOCATOR_BTN);",
+            "return this;",
+            True,
+        ),
+        (
+            "getText",
+            "public String getTestLocatorBtnText()",
+            "String text = getText(TEST_LOCATOR_BTN);",
+            "return text;",
+            False,
+        ),
+        (
+            "getAttribute",
+            "public String getTestLocatorBtnAttribute(String attribute)",
+            "String attr = getAttribute(TEST_LOCATOR_BTN, attribute);",
+            "return attr;",
+            False,
+        ),
+        (
+            "isElementDisplayed",
+            "public boolean isTestLocatorBtnDisplayed(int timeoutSeconds)",
+            "boolean ok = isElementDisplayed(TEST_LOCATOR_BTN, timeoutSeconds);",
+            "return ok;",
+            False,
+        ),
+        (
+            "isElementEnabled",
+            "public boolean isTestLocatorBtnEnabled(int timeoutSeconds)",
+            "boolean ok = isElementEnabled(TEST_LOCATOR_BTN, timeoutSeconds);",
+            "return ok;",
+            False,
+        ),
+        (
+            "scrollToElement",
+            "public FolderPage scrollToTestLocatorBtn()",
+            "scrollToElement(TEST_LOCATOR_BTN);",
+            "return this;",
+            True,
+        ),
+        (
+            "javaScriptClearAndSetValue",
+            "public FolderPage jsSetTestLocatorBtn(String value)",
+            "javaScriptClearAndSetValue(TEST_LOCATOR_BTN, value);",
+            "return this;",
+            True,
+        ),
+        (
+            "javaScriptGetInnerText",
+            "public String jsGetTestLocatorBtnInnerText()",
+            "String t = javaScriptGetInnerText(TEST_LOCATOR_BTN);",
+            "return t;",
+            False,
+        ),
+        (
+            "javaScriptGetValue",
+            "public String jsGetTestLocatorBtnValue()",
+            "String v = javaScriptGetValue(TEST_LOCATOR_BTN);",
+            "return v;",
+            False,
+        ),
+    ],
+)
+def test_action_method_templates(
+    action: str,
+    signature: str,
+    expected_call: str,
+    expected_return: str,
+    expects_log: bool,
+) -> None:
     source = """public class FolderPage extends BaseLibrary {
     // region AUTO_LOCATORS
     // endregion AUTO_LOCATORS
@@ -158,23 +255,24 @@ def test_action_method_insertion_click_and_sendkeys() -> None:
 
     result = prepare_java_patch(
         source=source,
-        locator_name="EV_YASAM_TXT",
+        locator_name="TEST_LOCATOR_BTN",
         selector_type="css",
-        selector_value="input[name='evYasam']",
-        actions=("click", "sendKeys"),
+        selector_value="button[data-testid='test-locator']",
+        actions=(action,),
     )
 
     assert result.ok
     assert result.changed
-    assert "public FolderPage clickEvYasamTxt()" in result.updated_source
-    assert "public FolderPage inputEvYasamTxt(String value)" in result.updated_source
-    assert "/**" in result.updated_source
-    assert "EV YASAM alanına tıklanır." in result.updated_source
-    assert "@param value yazılacak değer" in result.updated_source
-    assert 'logPass("EV YASAM alanına tıklandı.");' in result.updated_source
-    assert 'logPass("EV YASAM alanına değer yazıldı: " + value);' in result.updated_source
-    actions_region = _region_content(result.updated_source, "AUTO_ACTIONS")
-    assert "return this;" in actions_region
+    assert signature in result.updated_source
+    assert result.added_method_signatures == (signature,)
+    assert expected_call in result.updated_source
+    method_name = result.added_methods[0]
+    block = _method_block(result.updated_source, method_name)
+    assert expected_return in block
+    if expects_log:
+        assert "logPass(" in block
+    else:
+        assert "logPass(" not in block
 
 
 def test_method_name_collision_adds_suffix() -> None:
@@ -195,12 +293,12 @@ def test_method_name_collision_adds_suffix() -> None:
         locator_name="EV_YASAM_TXT",
         selector_type="css",
         selector_value="input[name='evYasam']",
-        actions=("click",),
+        actions=("clickElement",),
     )
 
     assert result.ok
     assert result.changed
-    assert "public FolderPage clickEvYasamTxt2()" in result.updated_source
+    assert "public FolderPage clickEvYasamTxt_2()" in result.updated_source
 
 
 def test_name_exists_shows_suffix_message() -> None:
@@ -241,7 +339,7 @@ def test_uncertain_parse_missing_class_closing_brace() -> None:
         locator_name="KURAL_ADI_TXT",
         selector_type="css",
         selector_value="input[name='kural']",
-        actions=("sendKeys",),
+        actions=("javaScriptClearAndSetValue",),
     )
 
     assert not result.ok
@@ -264,14 +362,33 @@ def test_action_method_insertion_english_logs_and_javadocs() -> None:
         locator_name="HOME_BTN",
         selector_type="xpath",
         selector_value="//button[normalize-space()='Home']",
-        actions=("click", "sendKeys"),
+        actions=("clickElement", "javaScriptClearAndSetValue"),
         log_language="EN",
     )
 
     assert result.ok
     assert result.changed
     assert "Clicks HOME element." in result.updated_source
-    assert "Types a value into HOME element." in result.updated_source
-    assert "@param value value to type" in result.updated_source
+    assert "Clears and sets HOME value via JavaScript." in result.updated_source
+    assert "@param value value to set" in result.updated_source
     assert 'logPass("Clicked HOME element.");' in result.updated_source
-    assert 'logPass("Entered value into HOME element: " + value);' in result.updated_source
+    assert 'logPass("Set HOME value via JavaScript: " + value);' in result.updated_source
+
+
+def test_build_action_method_signature_preview() -> None:
+    assert (
+        build_action_method_signature_preview(
+            page_class_name="FolderPage",
+            locator_name="EV_YASAM_TXT",
+            action="javaScriptClicker",
+        )
+        == "public FolderPage jsClickEvYasamTxt()"
+    )
+    assert (
+        build_action_method_signature_preview(
+            page_class_name="FolderPage",
+            locator_name="EV_YASAM_TXT",
+            action="getAttribute",
+        )
+        == "public String getEvYasamTxtAttribute(String attribute)"
+    )

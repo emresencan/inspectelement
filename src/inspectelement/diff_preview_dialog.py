@@ -18,6 +18,7 @@ class DiffPreviewDialog(QDialog):
         target_file: Path,
         final_locator_name: str | None,
         method_names: list[str],
+        method_signatures: list[str] | None,
         diff_text: str,
         summary_message: str | None = None,
         parent=None,
@@ -35,6 +36,15 @@ class DiffPreviewDialog(QDialog):
         methods_text = ", ".join(method_names) if method_names else "-"
         methods_label = QLabel(f"Methods to add: {methods_text}")
         methods_label.setWordWrap(True)
+
+        signatures_text = "\n".join(method_signatures or []) if method_signatures else "-"
+        signatures_label = QLabel("Method signatures:")
+        signatures_label.setWordWrap(True)
+
+        signatures_view = QPlainTextEdit()
+        signatures_view.setReadOnly(True)
+        signatures_view.setMaximumHeight(110)
+        signatures_view.setPlainText(signatures_text)
 
         summary_label = QLabel(summary_message or "")
         summary_label.setWordWrap(True)
@@ -60,6 +70,8 @@ class DiffPreviewDialog(QDialog):
         root_layout.addWidget(path_label)
         root_layout.addWidget(locator_label)
         root_layout.addWidget(methods_label)
+        root_layout.addWidget(signatures_label)
+        root_layout.addWidget(signatures_view)
         root_layout.addWidget(summary_label)
         root_layout.addWidget(diff_editor, 1)
         root_layout.addLayout(button_row)

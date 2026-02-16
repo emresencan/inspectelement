@@ -42,5 +42,25 @@ def test_invalid_chars_removed_and_priority_prefers_data_testid() -> None:
     assert suggest_element_name(summary) == "ADRES_ALANI_BTN"
 
 
+def test_clickable_prefers_visible_text_over_noisy_testid() -> None:
+    summary = _summary(
+        tag="a",
+        role="link",
+        text="Yemek",
+        attributes={"data-testid": "topslider-none-1-yemek"},
+    )
+    assert suggest_element_name(summary) == "YEMEK_LNK"
+
+
+def test_fallback_locator_text_is_extracted() -> None:
+    assert (
+        suggest_element_name(
+            summary=None,
+            fallback="//a[normalize-space()='Yemek']",
+        )
+        == "YEMEK_TXT"
+    )
+
+
 def test_to_upper_snake_handles_digit_prefix() -> None:
     assert to_upper_snake("123 deneme") == "E_123_DENEME"

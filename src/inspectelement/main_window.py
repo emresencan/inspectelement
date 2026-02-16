@@ -33,7 +33,12 @@ from PySide6.QtWidgets import (
 from .browser_manager import BrowserManager
 from .context_wizard import ContextSelection, ContextWizardDialog
 from .diff_preview_dialog import DiffPreviewDialog
-from .java_pom_writer import JavaPreview, apply_java_preview, generate_java_preview
+from .java_pom_writer import (
+    JavaPreview,
+    apply_java_preview,
+    build_action_method_signature_preview,
+    generate_java_preview,
+)
 from .locator_recommendation import recommend_locator_candidates
 from .models import ElementSummary, LocatorCandidate
 from .name_suggester import suggest_element_name
@@ -44,6 +49,27 @@ class EventBridge(QObject):
     capture_received = Signal(object, object)
     status_changed = Signal(str)
     page_changed = Signal(str, str)
+
+
+ACTION_PICKER_ITEMS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("clickElement", "Click", "clickElement", "Standard click using BaseLibrary.", "Fluent (returns this)"),
+    ("javaScriptClicker", "Click", "javaScriptClicker", "JavaScript click fallback.", "Fluent (returns this)"),
+    ("getText", "Read", "getText", "Reads visible text.", "Returns String"),
+    ("getAttribute", "Read", "getAttribute", "Reads selected attribute.", "Returns String"),
+    ("javaScriptGetInnerText", "Read", "javaScriptGetInnerText", "Reads innerText via JavaScript.", "Returns String"),
+    ("javaScriptGetValue", "Read", "javaScriptGetValue", "Reads value via JavaScript.", "Returns String"),
+    ("isElementDisplayed", "State", "isElementDisplayed", "Checks displayed state with timeout.", "Returns boolean"),
+    ("isElementEnabled", "State", "isElementEnabled", "Checks enabled state with timeout.", "Returns boolean"),
+    ("scrollToElement", "Scroll", "scrollToElement", "Scrolls into view before interaction.", "Fluent (returns this)"),
+    (
+        "javaScriptClearAndSetValue",
+        "JS Input",
+        "javaScriptClearAndSetValue",
+        "Clears and sets value via JavaScript.",
+        "Fluent (returns this)",
+    ),
+)
+ACTION_PICKER_ORDER: tuple[str, ...] = ("Click", "Read", "State", "Scroll", "JS Input")
 
 
 class MainWindow(QMainWindow):
@@ -118,10 +144,9 @@ class MainWindow(QMainWindow):
         self.element_name_input.setPlaceholderText("Element name (e.g. KURAL_ADI_TXT)")
         self.element_name_input.textChanged.connect(self._update_add_button_state)
 
-        self.click_action_checkbox = QCheckBox("click")
-        self.sendkeys_action_checkbox = QCheckBox("sendKeys")
-        self.click_action_checkbox.toggled.connect(self._on_action_selection_changed)
-        self.sendkeys_action_checkbox.toggled.connect(self._on_action_selection_changed)
+        self.action_checkboxes: dict[str, QCheckBox] = {}
+        self.action_preview_labels: dict[str, QLabel] = {}
+        self.action_picker_widget = self._build_action_picker()
 
         self.log_language_combo = QComboBox()
         self.log_language_combo.addItems(["TR", "EN"])
@@ -283,12 +308,10 @@ class MainWindow(QMainWindow):
         left_col.addLayout(editor_actions_row)
         left_col.addWidget(QLabel("Element Name:"))
         left_col.addWidget(self.element_name_input)
+        left_col.addWidget(QLabel("Action Picker:"))
+        left_col.addWidget(self.action_picker_widget)
 
         action_row = QHBoxLayout()
-        action_row.addWidget(QLabel("Actions:"))
-        action_row.addWidget(self.click_action_checkbox)
-        action_row.addWidget(self.sendkeys_action_checkbox)
-        action_row.addSpacing(12)
         action_row.addWidget(QLabel("Log:"))
         action_row.addWidget(self.log_language_combo)
         action_row.addStretch(1)
@@ -503,6 +526,31 @@ class MainWindow(QMainWindow):
                 padding: 6px;
                 font-weight: 600;
             }
+            QFrame#ActionPickerCard {
+                border: 1px solid #d5deec;
+                border-radius: 10px;
+                background: #f8fbff;
+            }
+            QLabel#ActionCategory {
+                color: #0f172a;
+                font-weight: 700;
+                margin-top: 2px;
+            }
+            QFrame#ActionRow {
+                border: 1px solid #deebf8;
+                border-radius: 8px;
+                background: #ffffff;
+            }
+            QLabel#ActionReturn {
+                color: #0b5f97;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QLabel#ActionPreview {
+                color: #334155;
+                font-family: "Menlo", "Consolas", monospace;
+                font-size: 11px;
+            }
             """
         )
 
@@ -510,6 +558,94 @@ class MainWindow(QMainWindow):
     def _runtime_summary() -> str:
         version = sys.version.split()[0]
         return f"Runtime: {sys.executable} (Python {version})"
+
+    def _build_action_picker(self) -> QWidget:
+        container = QFrame()
+        container.setObjectName("ActionPickerCard")
+        root_layout = QVBoxLayout(container)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(8)
+
+        grouped: dict[str, list[tuple[str, str, str, str, str]]] = {category: [] for category in ACTION_PICKER_ORDER}
+        for item in ACTION_PICKER_ITEMS:
+            grouped.setdefault(item[1], []).append(item)
+
+        for category in ACTION_PICKER_ORDER:
+            category_items = grouped.get(category, [])
+            if not category_items:
+                continue
+
+            category_label = QLabel(category)
+            category_label.setObjectName("ActionCategory")
+            root_layout.addWidget(category_label)
+
+            for action_key, _cat, action_label, description, return_hint in category_items:
+                row = QFrame()
+                row.setObjectName("ActionRow")
+                row_layout = QVBoxLayout(row)
+                row_layout.setContentsMargins(8, 8, 8, 8)
+                row_layout.setSpacing(3)
+
+                top_line = QHBoxLayout()
+                top_line.setContentsMargins(0, 0, 0, 0)
+                top_line.setSpacing(6)
+
+                action_checkbox = QCheckBox(action_label)
+                action_checkbox.toggled.connect(self._on_action_selection_changed)
+                action_checkbox.setObjectName("ActionToggle")
+
+                return_label = QLabel(return_hint)
+                return_label.setObjectName("ActionReturn")
+
+                top_line.addWidget(action_checkbox)
+                top_line.addStretch(1)
+                top_line.addWidget(return_label)
+
+                description_label = QLabel(description)
+                description_label.setObjectName("Muted")
+                description_label.setWordWrap(True)
+
+                preview_label = QLabel("")
+                preview_label.setObjectName("ActionPreview")
+                preview_label.setWordWrap(True)
+                preview_label.setVisible(False)
+
+                row_layout.addLayout(top_line)
+                row_layout.addWidget(description_label)
+                row_layout.addWidget(preview_label)
+                root_layout.addWidget(row)
+
+                self.action_checkboxes[action_key] = action_checkbox
+                self.action_preview_labels[action_key] = preview_label
+
+        return container
+
+    @staticmethod
+    def _action_label(action_key: str) -> str:
+        for key, _category, label, _description, _return_hint in ACTION_PICKER_ITEMS:
+            if key == action_key:
+                return label
+        return action_key
+
+    def _refresh_action_signature_previews(self) -> None:
+        selected_page = self._selected_page_class()
+        page_class_name = selected_page.class_name if selected_page else "PageClass"
+        locator_name = self.element_name_input.text().strip() or "ELEMENT"
+        for action_key, checkbox in self.action_checkboxes.items():
+            preview_label = self.action_preview_labels[action_key]
+            if not checkbox.isChecked():
+                preview_label.clear()
+                preview_label.setVisible(False)
+                continue
+
+            signature = build_action_method_signature_preview(page_class_name, locator_name, action_key)
+            if not signature:
+                preview_label.clear()
+                preview_label.setVisible(False)
+                continue
+
+            preview_label.setText(f"Method Preview: {signature}")
+            preview_label.setVisible(True)
 
     @staticmethod
     def _build_logger() -> logging.Logger:
@@ -608,6 +744,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _update_add_button_state(self) -> None:
+        self._refresh_action_signature_previews()
         has_page = self._selected_page_class() is not None
         has_locator = self._selected_candidate() is not None
         has_name = bool(self.element_name_input.text().strip())
@@ -619,13 +756,14 @@ class MainWindow(QMainWindow):
 
     def _selected_actions(self) -> list[str]:
         actions: list[str] = []
-        if self.click_action_checkbox.isChecked():
-            actions.append("click")
-        if self.sendkeys_action_checkbox.isChecked():
-            actions.append("sendKeys")
+        for action_key, _category, _label, _description, _return_hint in ACTION_PICKER_ITEMS:
+            checkbox = self.action_checkboxes.get(action_key)
+            if checkbox and checkbox.isChecked():
+                actions.append(action_key)
         return actions
 
     def _on_action_selection_changed(self) -> None:
+        self._refresh_action_signature_previews()
         self._refresh_payload_status()
 
     def _refresh_payload_status(self, prefix: str = "Payload preview") -> None:
@@ -637,7 +775,7 @@ class MainWindow(QMainWindow):
             return
 
         actions = self._selected_actions()
-        action_text = ", ".join(actions) if actions else "none"
+        action_text = ", ".join(self._action_label(action) for action in actions) if actions else "none"
         log_language = self.log_language_combo.currentText()
         self.payload_status_label.setText(
             f"{prefix}: {page.class_name} | {name} | {candidate.locator_type} | "
@@ -687,6 +825,7 @@ class MainWindow(QMainWindow):
                 target_file=preview.target_file,
                 final_locator_name=preview.final_locator_name,
                 method_names=list(preview.added_methods),
+                method_signatures=list(preview.added_method_signatures),
                 diff_text=preview.diff_text,
                 summary_message=preview.message,
                 parent=self,
