@@ -15,16 +15,37 @@ class TableRootCandidate:
     reason: str
     tag: str
     locator_name_hint: str
+    stable: bool
+    warning: str | None = None
 
 
 def detect_table_root_from_ancestry(ancestry: Iterable[dict[str, str]]) -> TableRootCandidate | None:
+    candidates = detect_table_root_candidates(ancestry)
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def detect_table_root_candidates(ancestry: Iterable[dict[str, str]]) -> list[TableRootCandidate]:
     ancestry_list = list(ancestry)
+    ranked: list[tuple[int, int, TableRootCandidate]] = []
     for index, raw_node in enumerate(ancestry_list):
         node = _normalize_node(raw_node)
         if not _is_table_like(node):
             continue
-        return _build_candidate(node=node, ancestry=ancestry_list, candidate_index=index)
-    return None
+        candidate = _build_candidate(node=node)
+        ranked.append((_candidate_priority(candidate.reason), index, candidate))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    deduped: list[TableRootCandidate] = []
+    seen: set[tuple[str, str]] = set()
+    for _priority, _index, candidate in ranked:
+        key = (candidate.selector_type, candidate.selector_value)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
 
 
 def _normalize_node(node: dict[str, str]) -> dict[str, str]:
@@ -45,7 +66,7 @@ def _is_table_like(node: dict[str, str]) -> bool:
     return any(token in combined for token in TABLE_LIKE_CLASS_TOKENS)
 
 
-def _build_candidate(node: dict[str, str], ancestry: list[dict[str, str]], candidate_index: int) -> TableRootCandidate:
+def _build_candidate(node: dict[str, str]) -> TableRootCandidate:
     tag = node.get("tag", "div").lower() or "div"
     element_id = node.get("id", "").strip()
     if element_id:
@@ -55,6 +76,7 @@ def _build_candidate(node: dict[str, str], ancestry: list[dict[str, str]], candi
             reason="id",
             tag=tag,
             locator_name_hint=_to_table_locator_name(element_id),
+            stable=True,
         )
 
     for attr in STABLE_ATTR_KEYS:
@@ -68,6 +90,7 @@ def _build_candidate(node: dict[str, str], ancestry: list[dict[str, str]], candi
             reason=attr,
             tag=tag,
             locator_name_hint=_to_table_locator_name(value),
+            stable=True,
         )
 
     role = node.get("role", "").strip().lower()
@@ -79,6 +102,7 @@ def _build_candidate(node: dict[str, str], ancestry: list[dict[str, str]], candi
             reason=f"role:{role}",
             tag=tag,
             locator_name_hint=_to_table_locator_name(role),
+            stable=True,
         )
 
     class_name = node.get("class", "").strip()
@@ -92,36 +116,34 @@ def _build_candidate(node: dict[str, str], ancestry: list[dict[str, str]], candi
                 reason="class",
                 tag=tag,
                 locator_name_hint=_to_table_locator_name(token),
+                stable=False,
+                warning="Unstable table root locator (class-based).",
             )
 
-    xpath = _fallback_xpath(ancestry, candidate_index)
+    xpath = _fallback_xpath(node)
     return TableRootCandidate(
         selector_type="xpath",
         selector_value=xpath,
         reason="fallback-xpath",
         tag=tag,
         locator_name_hint=_to_table_locator_name(tag),
+        stable=False,
+        warning="Unstable table root locator (xpath fallback).",
     )
 
 
-def _fallback_xpath(ancestry: list[dict[str, str]], candidate_index: int) -> str:
-    node = ancestry[candidate_index]
+def _fallback_xpath(node: dict[str, str]) -> str:
     tag = (node.get("tag", "div") or "div").lower()
     role = (node.get("role", "") or "").strip().lower()
     if role in {"table", "grid"}:
         return f"//{tag}[@role='{role}']"
 
-    steps: list[str] = []
-    for path_node in ancestry[candidate_index : candidate_index + 4]:
-        tag_name = (path_node.get("tag", "div") or "div").lower()
-        nth = path_node.get("nth", "").strip()
-        if nth.isdigit():
-            steps.append(f"{tag_name}[{nth}]")
-        else:
-            steps.append(tag_name)
-    if not steps:
-        return f"//{tag}"
-    return f"//{'/'.join(reversed(steps))}"
+    class_name = node.get("class", "").strip()
+    token = _first_valid_class_token(class_name)
+    if token:
+        return f"//{tag}[contains(concat(' ', normalize-space(@class), ' '), ' {token} ')]"
+
+    return f"//{tag}"
 
 
 def _first_valid_class_token(class_name: str) -> str | None:
@@ -147,3 +169,15 @@ def _to_table_locator_name(seed: str) -> str:
 
 def _escape_css(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _candidate_priority(reason: str) -> int:
+    if reason == "id":
+        return 0
+    if reason in STABLE_ATTR_KEYS:
+        return 1
+    if reason.startswith("role:"):
+        return 2
+    if reason == "class":
+        return 3
+    return 4

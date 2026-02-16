@@ -561,3 +561,58 @@ public class FolderPage extends BaseLibrary {
         "public FolderPage assertOrdersTableRowMatches(String columnHeader, Predicate<String> predicate, int timeoutSec)",
         "public FolderPage assertOrdersTableRowAllEquals(Map<String, String> columnToExpectedText, int timeoutSec)",
     )
+
+
+def test_import_injection_keeps_static_imports_and_avoids_duplicates() -> None:
+    source = """package com.turkcell.pages;
+
+import com.turkcell.common.components.table.HtmlTableVerifier;
+import static org.junit.Assert.assertTrue;
+import com.turkcell.common.components.table.HtmlTableVerifier;
+
+public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+    result = prepare_java_patch(
+        source=source,
+        locator_name="ROW_TXT",
+        selector_type="css",
+        selector_value="td.row",
+        actions=("tableHasAnyRow",),
+        table_root_selector_type="id",
+        table_root_selector_value="ordersGrid",
+        table_root_locator_name="ORDERS_TABLE",
+    )
+    assert result.ok
+    assert result.changed
+    assert result.updated_source.count("import com.turkcell.common.components.table.HtmlTableVerifier;") == 1
+    assert "import static org.junit.Assert.assertTrue;" in result.updated_source
+    assert "import java.time.Duration;" in result.updated_source
+
+
+def test_style_alignment_preserves_crlf_line_endings() -> None:
+    source = (
+        "package com.turkcell.pages;\r\n\r\n"
+        "public class FolderPage extends BaseLibrary {\r\n"
+        "    // region AUTO_LOCATORS\r\n"
+        "    // endregion AUTO_LOCATORS\r\n\r\n"
+        "    // region AUTO_ACTIONS\r\n"
+        "    // endregion AUTO_ACTIONS\r\n"
+        "}\r\n"
+    )
+    result = prepare_java_patch(
+        source=source,
+        locator_name="HOME_BTN",
+        selector_type="xpath",
+        selector_value="//button[normalize-space()='Home']",
+        actions=("clickElement",),
+    )
+    assert result.ok
+    assert result.changed
+    assert "\r\n" in result.updated_source
+    assert "\r\nprivate final By" not in result.updated_source  # keeps class indentation

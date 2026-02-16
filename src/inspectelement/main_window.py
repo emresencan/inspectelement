@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGridLayout,
+    QInputDialog,
     QHBoxLayout,
     QLayout,
     QLayoutItem,
@@ -57,7 +58,15 @@ from .java_pom_writer import (
 from .locator_recommendation import recommend_locator_candidates
 from .models import ElementSummary, LocatorCandidate
 from .name_suggester import suggest_element_name
+from .page_creator import (
+    PageCreationPreview,
+    apply_page_creation_preview,
+    generate_page_creation_preview,
+)
 from .project_discovery import ModuleInfo, PageClassInfo, discover_page_classes
+from .validation import validate_generation_request
+
+CREATE_NEW_PAGE_OPTION = "__CREATE_NEW_PAGE__"
 
 
 class EventBridge(QObject):
@@ -198,7 +207,8 @@ class MainWindow(QMainWindow):
         self.page_combo = QComboBox()
         self.page_combo.addItem("Select page class", None)
         self.page_combo.setEnabled(False)
-        self.page_combo.currentIndexChanged.connect(self._update_add_button_state)
+        self.page_combo.currentIndexChanged.connect(self._on_page_combo_changed)
+        self.page_combo_previous_index = 0
 
         self.runtime_info_label = QLabel(self._runtime_summary())
         self.runtime_info_label.setObjectName("Muted")
@@ -219,9 +229,12 @@ class MainWindow(QMainWindow):
         self.auto_table_root_selector_type: str | None = None
         self.auto_table_root_selector_value: str | None = None
         self.auto_table_root_locator_name: str | None = None
+        self.auto_table_root_warning: str | None = None
+        self.auto_table_root_candidates: list[dict[str, str]] = []
         self.manual_table_root_selector_type: str | None = None
         self.manual_table_root_selector_value: str | None = None
         self.manual_table_root_locator_name: str | None = None
+        self.manual_table_root_warning: str | None = None
 
         self.action_filter_group = QButtonGroup(self)
         self.action_filter_group.setExclusive(True)
@@ -254,6 +267,8 @@ class MainWindow(QMainWindow):
         self.table_root_section.setObjectName("TableRootSection")
         self.table_root_locator_preview = QLineEdit()
         self.table_root_locator_preview.setReadOnly(True)
+        self.table_root_warning_label = QLabel("")
+        self.table_root_warning_label.setObjectName("TableRootWarning")
         self.pick_table_root_button = QPushButton("Pick Table Root")
         self.pick_table_root_button.clicked.connect(self._start_table_root_pick_mode)
         self.clear_table_root_button = QPushButton("Clear Override")
@@ -284,6 +299,9 @@ class MainWindow(QMainWindow):
         self.add_button = QPushButton("Add")
         self.add_button.setEnabled(False)
         self.add_button.clicked.connect(self._prepare_add_request)
+        self.validate_button = QPushButton("Validate Only")
+        self.validate_button.setEnabled(False)
+        self.validate_button.clicked.connect(self._validate_only_request)
 
         self.payload_status_label = QLabel("Waiting for page, locator, and element name.")
         self.payload_status_label.setObjectName("Muted")
@@ -447,6 +465,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(QLabel("Log:"))
         action_row.addWidget(self.log_language_combo)
         action_row.addStretch(1)
+        action_row.addWidget(self.validate_button)
         action_row.addWidget(self.add_button)
         left_col.addLayout(action_row)
         left_col.addWidget(self.payload_status_label)
@@ -524,7 +543,7 @@ class MainWindow(QMainWindow):
             """
             QWidget {
                 color: #0f172a;
-                font-family: "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+                font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
                 font-size: 13px;
             }
             QMainWindow {
@@ -711,6 +730,10 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
                 background: #ffffff;
             }
+            QLabel#TableRootWarning {
+                color: #b91c1c;
+                font-weight: 600;
+            }
             """
         )
 
@@ -803,6 +826,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         layout.addWidget(hint)
         layout.addLayout(row)
+        layout.addWidget(self.table_root_warning_label)
+        self.table_root_warning_label.setVisible(False)
         self.table_root_section.setVisible(False)
         return self.table_root_section
 
@@ -973,6 +998,7 @@ class MainWindow(QMainWindow):
     def _refresh_table_root_section(self) -> None:
         needs_table = has_table_actions(self.selected_actions)
         self.table_root_section.setVisible(needs_table)
+        self.table_root_warning_label.setVisible(False)
         if not needs_table:
             return
 
@@ -982,6 +1008,10 @@ class MainWindow(QMainWindow):
             self.table_root_locator_preview.setText(f"{selector_type}: {selector_value}")
         else:
             self.table_root_locator_preview.setText("Table root could not be detected.")
+        warning = self._selected_table_root_warning()
+        if warning:
+            self.table_root_warning_label.setText(warning)
+            self.table_root_warning_label.setVisible(True)
 
     def _refresh_parameter_panel(self) -> None:
         required = set(required_parameter_keys(self.selected_actions))
@@ -1035,25 +1065,53 @@ class MainWindow(QMainWindow):
             base_name = f"{base_name}_TABLE"
         return re.sub(r"[^A-Z0-9_]+", "_", base_name)
 
+    def _selected_table_root_warning(self) -> str | None:
+        if self.manual_table_root_warning:
+            return self.manual_table_root_warning
+        return self.auto_table_root_warning
+
     def _set_auto_table_root_from_summary(self, summary: ElementSummary | None) -> None:
-        if not summary or not summary.table_root:
+        if not summary:
             self.auto_table_root_selector_type = None
             self.auto_table_root_selector_value = None
             self.auto_table_root_locator_name = None
+            self.auto_table_root_warning = None
+            self.auto_table_root_candidates = []
             self._refresh_table_root_section()
             return
 
-        selector_type = summary.table_root.get("selector_type")
-        selector_value = summary.table_root.get("selector_value")
-        locator_name_hint = summary.table_root.get("locator_name_hint")
+        candidates = list(summary.table_roots)
+        if not candidates and summary.table_root:
+            candidates = [summary.table_root]
+        self.auto_table_root_candidates = candidates
+        if not candidates:
+            self.auto_table_root_selector_type = None
+            self.auto_table_root_selector_value = None
+            self.auto_table_root_locator_name = None
+            self.auto_table_root_warning = None
+            self._refresh_table_root_section()
+            return
+
+        selected_candidate = candidates[0]
+        if len(candidates) > 1:
+            selected = self._choose_table_root_candidate(candidates)
+            if selected:
+                selected_candidate = selected
+
+        selector_type = selected_candidate.get("selector_type")
+        selector_value = selected_candidate.get("selector_value")
+        locator_name_hint = selected_candidate.get("locator_name_hint")
+        warning = selected_candidate.get("warning", "").strip() or None
         if selector_type and selector_value:
             self.auto_table_root_selector_type = selector_type
             self.auto_table_root_selector_value = selector_value
             self.auto_table_root_locator_name = locator_name_hint or self._selected_table_root_locator_name()
+            self.auto_table_root_warning = warning
         else:
             self.auto_table_root_selector_type = None
             self.auto_table_root_selector_value = None
             self.auto_table_root_locator_name = None
+            self.auto_table_root_warning = None
         self._refresh_table_root_section()
 
     def _set_manual_table_root(self, selector_type: str, selector_value: str, locator_name: str | None = None) -> None:
@@ -1063,16 +1121,43 @@ class MainWindow(QMainWindow):
             self.manual_table_root_locator_name = locator_name
         else:
             self.manual_table_root_locator_name = self._selected_table_root_locator_name()
+        if selector_type == "xpath":
+            self.manual_table_root_warning = "Warning: unstable table root locator (xpath)."
+        else:
+            self.manual_table_root_warning = None
         self._refresh_table_root_section()
 
     def _clear_manual_table_root(self) -> None:
         self.manual_table_root_selector_type = None
         self.manual_table_root_selector_value = None
         self.manual_table_root_locator_name = None
+        self.manual_table_root_warning = None
         self.pick_table_root_mode = False
         self._set_status("Manual table root override cleared.")
         self._refresh_table_root_section()
         self._update_generated_methods_preview()
+
+    def _choose_table_root_candidate(self, candidates: list[dict[str, str]]) -> dict[str, str] | None:
+        labels: list[str] = []
+        lookup: dict[str, dict[str, str]] = {}
+        for index, candidate in enumerate(candidates, start=1):
+            selector_type = candidate.get("selector_type", "?")
+            selector_value = candidate.get("selector_value", "?")
+            reason = candidate.get("reason", "-")
+            label = f"{index}. {selector_type}: {selector_value} ({reason})"
+            labels.append(label)
+            lookup[label] = candidate
+        selected_label, ok = QInputDialog.getItem(
+            self,
+            "Select Table Root",
+            "Multiple table roots detected. Select one:",
+            labels,
+            0,
+            False,
+        )
+        if not ok:
+            return None
+        return lookup.get(selected_label)
 
     def _start_table_root_pick_mode(self) -> None:
         self.pick_table_root_mode = True
@@ -1203,9 +1288,12 @@ class MainWindow(QMainWindow):
         self.manual_table_root_selector_type = None
         self.manual_table_root_selector_value = None
         self.manual_table_root_locator_name = None
+        self.manual_table_root_warning = None
         self.auto_table_root_selector_type = None
         self.auto_table_root_selector_value = None
         self.auto_table_root_locator_name = None
+        self.auto_table_root_warning = None
+        self.auto_table_root_candidates = []
         self._refresh_page_classes()
 
         root_text = str(selection.project_root)
@@ -1224,6 +1312,7 @@ class MainWindow(QMainWindow):
         self._reset_generated_preview_override()
         self.page_combo.clear()
         self.page_combo.addItem("Select page class", None)
+        self.page_combo_previous_index = 0
 
         if not self.selected_module:
             self.discovered_pages = []
@@ -1236,10 +1325,17 @@ class MainWindow(QMainWindow):
         for page in pages:
             self.page_combo.addItem(page.class_name, page)
 
-        has_pages = bool(pages)
-        self.page_combo.setEnabled(has_pages)
-        if has_pages:
+        can_create_page = bool(self.selected_module.pages_source_root)
+        if can_create_page:
+            self.page_combo.addItem("+ Create New Page...", CREATE_NEW_PAGE_OPTION)
+
+        self.page_combo.setEnabled(can_create_page)
+        if pages:
             self.page_combo.setCurrentIndex(1)
+            self.page_combo_previous_index = 1
+        else:
+            self.page_combo.setCurrentIndex(0)
+            self.page_combo_previous_index = 0
         self._update_add_button_state()
 
     def _selected_page_class(self) -> PageClassInfo | None:
@@ -1248,12 +1344,93 @@ class MainWindow(QMainWindow):
             return selected
         return None
 
+    def _on_page_combo_changed(self, _index: int) -> None:
+        selected = self.page_combo.currentData()
+        if selected == CREATE_NEW_PAGE_OPTION:
+            self._create_new_page_flow()
+            return
+        self.page_combo_previous_index = self.page_combo.currentIndex()
+        self._update_add_button_state()
+
+    def _create_new_page_flow(self) -> None:
+        if not self.selected_module:
+            self._set_status("Select module before creating page.")
+            self._restore_page_combo_selection()
+            return
+
+        page_name, ok = QInputDialog.getText(
+            self,
+            "Create New Page",
+            "Page Name (PascalCase):",
+        )
+        if not ok:
+            self._set_status("Cancelled — no page created.")
+            self._restore_page_combo_selection()
+            return
+
+        preview = generate_page_creation_preview(
+            module=self.selected_module,
+            existing_pages=self.discovered_pages,
+            page_name_raw=page_name,
+        )
+        if not preview.ok:
+            self._set_status(preview.message)
+            self._show_toast(preview.message)
+            self._restore_page_combo_selection()
+            return
+
+        self._show_page_creation_preview(preview)
+
+    def _show_page_creation_preview(self, preview: PageCreationPreview) -> None:
+        preview_dialog = DiffPreviewDialog(
+            target_file=preview.target_file,
+            final_locator_name=None,
+            method_names=[],
+            method_signatures=[],
+            diff_text=preview.diff_text,
+            summary_message=preview.message,
+            parent=self,
+        )
+        if preview_dialog.exec() != QDialog.DialogCode.Accepted:
+            self._set_status("Cancelled — no changes.")
+            self._show_toast("Cancelled — no changes.")
+            self._restore_page_combo_selection()
+            return
+
+        applied, message = apply_page_creation_preview(preview)
+        self._set_status(message)
+        self._show_toast(message)
+        if not applied:
+            self._restore_page_combo_selection()
+            return
+
+        created_class_name = preview.class_name
+        self._refresh_page_classes()
+        if created_class_name:
+            for index in range(self.page_combo.count()):
+                data = self.page_combo.itemData(index)
+                if isinstance(data, PageClassInfo) and data.class_name == created_class_name:
+                    self.page_combo.setCurrentIndex(index)
+                    self.page_combo_previous_index = index
+                    break
+        self._update_add_button_state()
+
+    def _restore_page_combo_selection(self) -> None:
+        target_index = self.page_combo_previous_index
+        if target_index < 0 or target_index >= self.page_combo.count():
+            target_index = 0
+        self.page_combo.blockSignals(True)
+        self.page_combo.setCurrentIndex(target_index)
+        self.page_combo.blockSignals(False)
+        self._update_add_button_state()
+
     def _update_add_button_state(self) -> None:
         self._update_generated_methods_preview()
         has_page = self._selected_page_class() is not None
         has_locator = self._selected_candidate() is not None
         has_name = bool(self.element_name_input.text().strip())
         self.add_button.setEnabled(has_page and has_locator and has_name)
+        self.validate_button.setEnabled(has_page and has_locator and has_name)
         if not (has_page and has_locator and has_name):
             self.payload_status_label.setText("Waiting for page, locator, and element name.")
         else:
@@ -1286,53 +1463,7 @@ class MainWindow(QMainWindow):
 
     def _prepare_add_request(self) -> None:
         try:
-            page = self._selected_page_class()
-            candidate = self._selected_candidate()
-            element_name = self.element_name_input.text().strip()
-            if not page or not candidate or not element_name:
-                self._set_status("Select page, locator, and element name before Add.")
-                self._show_toast("Add icin zorunlu alanlar eksik")
-                self._update_add_button_state()
-                return
-
-            actions = self._selected_actions()
-            action_parameters = self._collect_action_parameters()
-            if has_table_actions(actions):
-                table_root_selector = self._selected_table_root_selector()
-                if not table_root_selector:
-                    message = "Table root could not be detected. Please pick the table root container."
-                    self._set_status(message)
-                    self.payload_status_label.setText(message)
-                    self._show_toast(message)
-                    return
-            if "selectBySelectIdAuto" in actions:
-                if not action_parameters.get("selectId", "").strip():
-                    message = "Select Id is required for selectBySelectIdAuto."
-                    self._set_status(message)
-                    self.payload_status_label.setText(message)
-                    self._show_toast(message)
-                    return
-            selector_details = self._resolve_java_selector(candidate)
-            if not selector_details:
-                self._set_status("Selected locator type cannot be written to Java. Choose CSS/XPath/Selenium.")
-                self.payload_status_label.setText("Selected locator type cannot be written to Java.")
-                self._show_toast("Desteklenmeyen locator tipi")
-                return
-
-            selector_type, selector_value = selector_details
-            selected_table_root = self._selected_table_root_selector()
-            preview = generate_java_preview(
-                target_file=page.file_path,
-                locator_name=element_name,
-                selector_type=selector_type,
-                selector_value=selector_value,
-                actions=actions,
-                log_language=self.log_language_combo.currentText(),
-                action_parameters=action_parameters,
-                table_root_selector_type=selected_table_root[0] if selected_table_root else None,
-                table_root_selector_value=selected_table_root[1] if selected_table_root else None,
-                table_root_locator_name=self._selected_table_root_locator_name() if selected_table_root else None,
-            )
+            preview = self._generate_preview_for_current_request()
             if not preview.ok:
                 self.pending_java_preview = None
                 self._set_status(preview.message)
@@ -1345,7 +1476,7 @@ class MainWindow(QMainWindow):
             self.payload_status_label.setText(preview.message)
             self.preview_locator_name_override = preview.final_locator_name
             self.preview_signatures_override = list(preview.added_method_signatures)
-            self.preview_signatures_actions_snapshot = tuple(actions)
+            self.preview_signatures_actions_snapshot = tuple(self._selected_actions())
             self._update_generated_methods_preview()
 
             preview_dialog = DiffPreviewDialog(
@@ -1375,6 +1506,90 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.pending_java_preview = None
             self._handle_ui_exception("Unexpected error during preview/apply. See ~/.inspectelement/ui.log.", exc)
+
+    def _validate_only_request(self) -> None:
+        try:
+            preview = self._generate_preview_for_current_request()
+            if not preview.ok:
+                self._set_status(preview.message)
+                self.payload_status_label.setText(preview.message)
+                self._show_toast(preview.message)
+                return
+            self._set_status("Validation successful. Preview can be generated and applied safely.")
+            self.payload_status_label.setText("Validation successful. No files written.")
+            self._show_toast("Validation successful")
+        except Exception as exc:
+            self._handle_ui_exception("Validation failed unexpectedly. See ~/.inspectelement/ui.log.", exc)
+
+    def _generate_preview_for_current_request(self) -> JavaPreview:
+        validation_error = self._validate_current_request()
+        if validation_error:
+            return JavaPreview(
+                ok=False,
+                target_file=Path("."),
+                message=validation_error,
+                diff_text="",
+                final_locator_name=None,
+                added_methods=(),
+                added_method_signatures=(),
+                original_source=None,
+                updated_source=None,
+                notes=(),
+            )
+
+        page = self._selected_page_class()
+        candidate = self._selected_candidate()
+        assert page is not None
+        assert candidate is not None
+
+        selector_details = self._resolve_java_selector(candidate)
+        if not selector_details:
+            return JavaPreview(
+                ok=False,
+                target_file=page.file_path,
+                message="Selected locator type cannot be written to Java. Choose CSS/XPath/Selenium.",
+                diff_text="",
+                final_locator_name=None,
+                added_methods=(),
+                added_method_signatures=(),
+                original_source=None,
+                updated_source=None,
+                notes=(),
+            )
+
+        selector_type, selector_value = selector_details
+        selected_table_root = self._selected_table_root_selector()
+        return generate_java_preview(
+            target_file=page.file_path,
+            locator_name=self.element_name_input.text().strip(),
+            selector_type=selector_type,
+            selector_value=selector_value,
+            actions=self._selected_actions(),
+            log_language=self.log_language_combo.currentText(),
+            action_parameters=self._collect_action_parameters(),
+            table_root_selector_type=selected_table_root[0] if selected_table_root else None,
+            table_root_selector_value=selected_table_root[1] if selected_table_root else None,
+            table_root_locator_name=self._selected_table_root_locator_name() if selected_table_root else None,
+        )
+
+    def _validate_current_request(self) -> str | None:
+        page = self._selected_page_class()
+        candidate = self._selected_candidate()
+        actions = self._selected_actions()
+        action_parameters = self._collect_action_parameters()
+        has_table_root = self._selected_table_root_selector() is not None
+
+        result = validate_generation_request(
+            has_page=page is not None,
+            has_locator=candidate is not None,
+            element_name=self.element_name_input.text().strip(),
+            actions=actions,
+            action_parameters=action_parameters,
+            has_table_root=has_table_root,
+        )
+        if not result.ok:
+            return result.message
+        return None
 
     def _resolve_java_selector(self, candidate: LocatorCandidate) -> tuple[str, str] | None:
         locator_type = candidate.locator_type
@@ -1536,6 +1751,8 @@ class MainWindow(QMainWindow):
                 locator_name_hint = None
                 if summary.table_root:
                     locator_name_hint = summary.table_root.get("locator_name_hint")
+                elif summary.table_roots:
+                    locator_name_hint = summary.table_roots[0].get("locator_name_hint")
                 self._set_manual_table_root(
                     selector_type=root_selector[0],
                     selector_value=root_selector[1],

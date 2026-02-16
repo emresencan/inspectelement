@@ -8,6 +8,8 @@ import re
 import tempfile
 from typing import Sequence
 
+from .import_parser import ensure_java_imports
+
 SAFE_PARSE_ERROR = "Could not safely locate class body/markers; no changes applied."
 SUPPORTED_ACTIONS: tuple[str, ...] = (
     "clickElement",
@@ -114,6 +116,8 @@ def prepare_java_patch(
     normalized_log_language = _normalize_log_language(log_language)
     parameters = {str(key): str(value) for key, value in (action_parameters or {}).items()}
     notes: list[str] = []
+    line_ending = _detect_line_ending(source)
+    indent_unit = _detect_indent_unit(source)
     class_span = _find_primary_class_span(source)
     if class_span is None:
         return JavaPatchResult(
@@ -129,7 +133,12 @@ def prepare_java_patch(
 
     class_name, open_brace_index, close_brace_index = class_span
     class_inner = source[open_brace_index + 1 : close_brace_index]
-    class_inner = _ensure_regions(class_inner, class_name)
+    class_inner = _ensure_regions(
+        class_inner,
+        class_name,
+        indent_unit=indent_unit,
+        line_ending=line_ending,
+    )
     updated_source = source[: open_brace_index + 1] + class_inner + source[close_brace_index:]
 
     actions_normalized = _normalize_actions(actions)
@@ -160,7 +169,13 @@ def prepare_java_patch(
             if locator_constant != requested_locator_name:
                 notes.append(f"Name exists; using {locator_constant}")
             locator_line = f"private final By {locator_constant} = {by_expression};"
-            updated_source = _insert_region_entry(updated_source, "AUTO_LOCATORS", locator_line)
+            updated_source = _insert_region_entry(
+                updated_source,
+                "AUTO_LOCATORS",
+                locator_line,
+                indent_unit=indent_unit,
+                line_ending=line_ending,
+            )
             if updated_source is None:
                 return JavaPatchResult(
                     ok=False,
@@ -212,7 +227,13 @@ def prepare_java_patch(
             if table_locator_constant != requested_table_name:
                 notes.append(f"Table name exists; using {table_locator_constant}")
             table_locator_line = f"private final By {table_locator_constant} = {table_by_expression};"
-            updated_source = _insert_region_entry(updated_source, "AUTO_LOCATORS", table_locator_line)
+            updated_source = _insert_region_entry(
+                updated_source,
+                "AUTO_LOCATORS",
+                table_locator_line,
+                indent_unit=indent_unit,
+                line_ending=line_ending,
+            )
             if updated_source is None:
                 return JavaPatchResult(
                     ok=False,
@@ -256,7 +277,13 @@ def prepare_java_patch(
             log_language=normalized_log_language,
             action_parameters=parameters,
         )
-        patched = _insert_region_entry(updated_source, "AUTO_ACTIONS", method_body)
+        patched = _insert_region_entry(
+            updated_source,
+            "AUTO_ACTIONS",
+            method_body,
+            indent_unit=indent_unit,
+            line_ending=line_ending,
+        )
         if patched is None:
             return JavaPatchResult(
                 ok=False,
@@ -274,6 +301,7 @@ def prepare_java_patch(
 
     required_imports = _required_imports_for_actions(actions_normalized)
     updated_source = _ensure_required_imports(updated_source, required_imports)
+    updated_source = _finalize_generated_source(updated_source, line_ending)
 
     if updated_source == source:
         if notes:
@@ -473,7 +501,13 @@ def _find_matching_brace(text: str, open_brace_index: int) -> int | None:
     return None
 
 
-def _ensure_regions(class_inner: str, class_name: str) -> str:
+def _ensure_regions(
+    class_inner: str,
+    class_name: str,
+    *,
+    indent_unit: str,
+    line_ending: str,
+) -> str:
     updated = class_inner
 
     if _find_region(updated, "AUTO_LOCATORS") is None:
@@ -481,22 +515,22 @@ def _ensure_regions(class_inner: str, class_name: str) -> str:
         if insertion_index is None:
             insertion_index = 0
         locators_block = (
-            "\n"
-            "    // region AUTO_LOCATORS\n"
-            "    // endregion AUTO_LOCATORS\n"
-            "\n"
+            f"{line_ending}"
+            f"{indent_unit}// region AUTO_LOCATORS{line_ending}"
+            f"{indent_unit}// endregion AUTO_LOCATORS{line_ending}"
+            f"{line_ending}"
         )
         updated = updated[:insertion_index] + locators_block + updated[insertion_index:]
 
     if _find_region(updated, "AUTO_ACTIONS") is None:
         trimmed = updated.rstrip()
-        tail = "\n" if not updated.endswith("\n") else ""
+        tail = line_ending if not updated.endswith(("\n", "\r")) else ""
         actions_block = (
-            "\n"
-            "    // region AUTO_ACTIONS\n"
-            "    // endregion AUTO_ACTIONS\n"
+            f"{line_ending}"
+            f"{indent_unit}// region AUTO_ACTIONS{line_ending}"
+            f"{indent_unit}// endregion AUTO_ACTIONS{line_ending}"
         )
-        updated = trimmed + actions_block + tail + "\n"
+        updated = trimmed + actions_block + tail + line_ending
 
     return updated
 
@@ -526,12 +560,12 @@ class _Region:
 
 
 def _find_region(source: str, region_name: str) -> _Region | None:
-    marker_pattern = re.compile(rf"(?m)^(?P<indent>[ \t]*)// region {re.escape(region_name)}[ \t]*$")
+    marker_pattern = re.compile(rf"(?m)^(?P<indent>[ \t]*)// region {re.escape(region_name)}[ \t]*\r?$")
     start_match = marker_pattern.search(source)
     if not start_match:
         return None
 
-    end_pattern = re.compile(rf"(?m)^[ \t]*// endregion {re.escape(region_name)}[ \t]*$")
+    end_pattern = re.compile(rf"(?m)^[ \t]*// endregion {re.escape(region_name)}[ \t]*\r?$")
     end_match = end_pattern.search(source, start_match.end())
     if not end_match:
         return None
@@ -546,18 +580,32 @@ def _find_region(source: str, region_name: str) -> _Region | None:
     return _Region(start_content=start_content, end_content=end_content, indent=start_match.group("indent"))
 
 
-def _insert_region_entry(source: str, region_name: str, entry: str) -> str | None:
+def _insert_region_entry(
+    source: str,
+    region_name: str,
+    entry: str,
+    *,
+    indent_unit: str,
+    line_ending: str,
+) -> str | None:
     region = _find_region(source, region_name)
     if region is None:
         return None
 
-    code_indent = f"{region.indent}    "
-    entry_lines = entry.splitlines()
-    formatted_entry = "\n".join(f"{code_indent}{line}" if line else "" for line in entry_lines) + "\n"
+    code_indent = f"{region.indent}{indent_unit}"
+    normalized_entry = _normalize_line_endings(entry, "\n")
+    entry_lines = normalized_entry.split("\n")
+    if entry_lines and entry_lines[-1] == "":
+        entry_lines = entry_lines[:-1]
+    formatted_lines: list[str] = []
+    for line in entry_lines:
+        adapted = _adapt_indent_to_style(line, indent_unit)
+        formatted_lines.append(f"{code_indent}{adapted}" if adapted else "")
+    formatted_entry = line_ending.join(formatted_lines) + line_ending
 
     region_content = source[region.start_content : region.end_content]
     if region_content.strip():
-        new_region_content = region_content.rstrip() + "\n\n" + formatted_entry
+        new_region_content = region_content.rstrip(" \t\r\n") + f"{line_ending}{line_ending}" + formatted_entry
     else:
         new_region_content = formatted_entry
 
@@ -634,36 +682,47 @@ def _required_imports_for_actions(actions: Sequence[str]) -> list[str]:
 
 
 def _ensure_required_imports(source: str, required_imports: Sequence[str]) -> str:
-    if not required_imports:
-        return source
+    return ensure_java_imports(source, required_imports)
 
-    lines = source.splitlines(keepends=True)
-    existing_imports: set[str] = set()
-    last_import_index = -1
-    package_index = -1
 
-    import_pattern = re.compile(r"^\s*import\s+([A-Za-z0-9_.*]+)\s*;\s*$")
-    package_pattern = re.compile(r"^\s*package\s+[A-Za-z0-9_.]+\s*;\s*$")
+def _detect_line_ending(source: str) -> str:
+    return "\r\n" if "\r\n" in source else "\n"
 
-    for index, line in enumerate(lines):
-        import_match = import_pattern.match(line)
-        if import_match:
-            existing_imports.add(import_match.group(1))
-            last_import_index = index
+
+def _detect_indent_unit(source: str) -> str:
+    for line in source.splitlines():
+        stripped = line.lstrip(" \t")
+        if not stripped:
             continue
-        if package_pattern.match(line):
-            package_index = index
+        indent = line[: len(line) - len(stripped)]
+        if "\t" in indent:
+            return "\t"
+    return "    "
 
-    missing = [item for item in required_imports if item not in existing_imports]
-    if not missing:
-        return source
 
-    insertion_index = last_import_index + 1 if last_import_index >= 0 else package_index + 1
-    insert_lines = [f"import {item};\n" for item in missing]
-    if insertion_index > 0 and (insertion_index >= len(lines) or lines[insertion_index - 1].strip()):
-        insert_lines.insert(0, "\n")
-    lines[insertion_index:insertion_index] = insert_lines
-    return "".join(lines)
+def _normalize_line_endings(source: str, line_ending: str) -> str:
+    normalized = source.replace("\r\n", "\n").replace("\r", "\n")
+    if line_ending == "\n":
+        return normalized
+    return normalized.replace("\n", line_ending)
+
+
+def _finalize_generated_source(source: str, line_ending: str) -> str:
+    return _normalize_line_endings(source, line_ending)
+
+
+def _adapt_indent_to_style(line: str, indent_unit: str) -> str:
+    if indent_unit == "    ":
+        return line
+    if not line:
+        return line
+    stripped = line.lstrip(" ")
+    leading_spaces = len(line) - len(stripped)
+    if leading_spaces == 0:
+        return line
+    tabs = leading_spaces // 4
+    remainder = leading_spaces % 4
+    return f"{indent_unit * tabs}{' ' * remainder}{stripped}"
 
 
 def build_action_method_signature_preview(

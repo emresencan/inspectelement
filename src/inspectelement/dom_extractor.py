@@ -4,7 +4,7 @@ from playwright.sync_api import ElementHandle
 
 from .locator_generator import normalize_classes
 from .models import ElementSummary
-from .table_root_detection import detect_table_root_from_ancestry
+from .table_root_detection import detect_table_root_candidates
 
 
 def extract_element_summary(element: ElementHandle) -> ElementSummary:
@@ -79,15 +79,31 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
         for item in payload.get("ancestry", [])
         if isinstance(item, dict)
     ]
-    table_root_candidate = detect_table_root_from_ancestry(ancestry)
+    table_root_candidates = detect_table_root_candidates(ancestry)
     table_root = None
-    if table_root_candidate:
+    table_roots: list[dict[str, str]] = []
+    for candidate in table_root_candidates:
+        table_roots.append(
+            {
+                "selector_type": candidate.selector_type,
+                "selector_value": candidate.selector_value,
+                "reason": candidate.reason,
+                "tag": candidate.tag,
+                "locator_name_hint": candidate.locator_name_hint,
+                "stable": "true" if candidate.stable else "false",
+                "warning": candidate.warning or "",
+            }
+        )
+    if table_root_candidates:
+        table_root_candidate = table_root_candidates[0]
         table_root = {
             "selector_type": table_root_candidate.selector_type,
             "selector_value": table_root_candidate.selector_value,
             "reason": table_root_candidate.reason,
             "tag": table_root_candidate.tag,
             "locator_name_hint": table_root_candidate.locator_name_hint,
+            "stable": "true" if table_root_candidate.stable else "false",
+            "warning": table_root_candidate.warning or "",
         }
 
     return ElementSummary(
@@ -103,4 +119,5 @@ def extract_element_summary(element: ElementHandle) -> ElementSummary:
         attributes={str(k): str(v) for k, v in payload.get("attributes", {}).items()},
         ancestry=ancestry,
         table_root=table_root,
+        table_roots=table_roots,
     )
