@@ -56,8 +56,7 @@ def test_template_contains_expected_standard() -> None:
     assert "import org.openqa.selenium.WebDriver;" in template
     assert "import com.turkcell.common.BaseLibrary;" in template
     assert "public class NewPageName extends BaseLibrary {" in template
-    assert "private final By BTN_EDIT_MODE =" in template
-    assert 'By.xpath("//a[contains(text(),\'Edit Moda Geç\')]");' in template
+    assert "private final By BTN_EDIT_MODE =" not in template
     assert "public NewPageName(WebDriver driver) {" in template
     assert "// region AUTO_LOCATORS" in template
     assert "// region AUTO_ACTIONS" in template

@@ -925,9 +925,10 @@ class WorkspaceWindow(QMainWindow):
         self._reload_modules_from_project_root(preferred_module_name=state.module_name, persist=False)
         if state.page_class_name:
             self._select_page_in_combo(state.page_class_name)
-        self.inspect_toggle.setChecked(bool(state.inspect_enabled))
-        self.inspect_toggle.setText(f"Inspect: {'ON' if state.inspect_enabled else 'OFF'}")
-        self._pending_inspect_restore = bool(state.inspect_enabled)
+        # Startup policy: always begin with inspect mode OFF.
+        self.inspect_toggle.setChecked(False)
+        self.inspect_toggle.setText("Inspect: OFF")
+        self._pending_inspect_restore = False
         self._loading_workspace_state = False
         self._set_status("Workspace context restored from config.json.")
 
