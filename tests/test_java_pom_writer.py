@@ -183,6 +183,13 @@ def test_duplicate_selector_reuses_existing_constant_and_generates_method() -> N
             True,
         ),
         (
+            "sendKeys",
+            "public FolderPage setTestLocatorBtn(String value)",
+            "sendKeys(TEST_LOCATOR_BTN, value);",
+            "return this;",
+            True,
+        ),
+        (
             "getText",
             "public String getTestLocatorBtnText()",
             "String text = getText(TEST_LOCATOR_BTN);",
@@ -278,7 +285,7 @@ def test_action_method_templates(
         assert "logPass(" not in block
 
 
-def test_method_name_collision_adds_suffix() -> None:
+def test_method_name_collision_skips_same_signature_with_warning() -> None:
     source = """public class FolderPage extends BaseLibrary {
     // region AUTO_LOCATORS
     // endregion AUTO_LOCATORS
@@ -301,7 +308,40 @@ def test_method_name_collision_adds_suffix() -> None:
 
     assert result.ok
     assert result.changed
-    assert "public FolderPage clickEvYasamTxt_2()" in result.updated_source
+    assert "public FolderPage clickEvYasamTxt_2()" not in result.updated_source
+    assert "Warning: method already exists; skipping duplicate (public FolderPage clickEvYasamTxt())." in result.message
+    assert result.added_methods == ()
+    assert result.added_method_signatures == ()
+
+
+def test_same_element_different_method_is_added() -> None:
+    source = """public class FolderPage extends BaseLibrary {
+    private final By EV_YASAM_TXT = By.cssSelector("input[name='evYasam']");
+
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+        public FolderPage clickEvYasamTxt() {
+            clickElement(EV_YASAM_TXT);
+            return this;
+        }
+    // endregion AUTO_ACTIONS
+}
+"""
+
+    result = prepare_java_patch(
+        source=source,
+        locator_name="EV_YASAM_TXT",
+        selector_type="css",
+        selector_value="input[name='evYasam']",
+        actions=("getText",),
+    )
+
+    assert result.ok
+    assert result.changed
+    assert "Warning: method already exists" not in result.message
+    assert "public String getEvYasamTxtText()" in result.updated_source
 
 
 def test_name_exists_shows_suffix_message() -> None:
@@ -701,3 +741,39 @@ def test_apply_java_previews_applies_staged_queue_in_single_write(tmp_path: Path
     final_source = target_file.read_text(encoding="utf-8")
     assert "public FolderPage clickHomeBtn()" in final_source
     assert "public String getTitleTxtText()" in final_source
+
+
+def test_duplicate_method_signature_is_skipped_with_warning_note() -> None:
+    source = """public class SonSayfa extends BaseLibrary {
+    private final By APJFQB_TXT = By.id("APjFqb");
+
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+        /**
+         * APJFQB alanına değer yazılır.
+         *
+         * @param value yazılacak değer
+         * @return this
+         */
+        public SonSayfa setApjfqbTxt(String value) {
+            sendKeys(APJFQB_TXT, value);
+            logPass("APJFQB alanına değer yazıldı: " + value);
+            return this;
+        }
+    // endregion AUTO_ACTIONS
+}
+"""
+    result = prepare_java_patch(
+        source=source,
+        locator_name="APJFQB_TXT",
+        selector_type="id",
+        selector_value="APjFqb",
+        actions=("sendKeys",),
+    )
+
+    assert result.ok
+    assert result.changed is False
+    assert "Warning: method already exists; skipping duplicate" in result.message
+    assert "setApjfqbTxt_2" not in result.updated_source

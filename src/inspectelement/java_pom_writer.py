@@ -14,6 +14,7 @@ SAFE_PARSE_ERROR = "Could not safely locate class body/markers; no changes appli
 SUPPORTED_ACTIONS: tuple[str, ...] = (
     "clickElement",
     "javaScriptClicker",
+    "sendKeys",
     "getText",
     "getAttribute",
     "isElementDisplayed",
@@ -64,6 +65,7 @@ SELECT_ACTIONS: set[str] = {"selectBySelectIdAuto", "selectByLabel"}
 ELEMENT_LOCATOR_ACTIONS: set[str] = {
     "clickElement",
     "javaScriptClicker",
+    "sendKeys",
     "getText",
     "getAttribute",
     "isElementDisplayed",
@@ -266,17 +268,39 @@ def prepare_java_patch(
     added_method_signatures: list[str] = []
     for action in actions_normalized:
         method_base_locator = table_locator_constant if action in TABLE_ACTIONS else locator_constant
-        method_name = _resolve_unique_method_name(updated_source, _method_base_name(action, method_base_locator))
-        method_signature = _build_method_signature(page_class_name=class_name, action=action, method_name=method_name)
-        method_body = _build_method_snippet(
+        desired_method_name = _method_base_name(action, method_base_locator)
+        desired_signature = _build_method_signature(
             page_class_name=class_name,
             action=action,
-            method_name=method_name,
+            method_name=desired_method_name,
+        )
+        desired_method_body = _build_method_snippet(
+            page_class_name=class_name,
+            action=action,
+            method_name=desired_method_name,
             locator_constant=locator_constant,
             table_locator_constant=table_locator_constant,
             log_language=normalized_log_language,
             action_parameters=parameters,
         )
+        if _contains_method_signature(updated_source, desired_signature):
+            notes.append(f"Warning: method already exists; skipping duplicate ({desired_signature}).")
+            continue
+
+        method_name = _resolve_unique_method_name(updated_source, desired_method_name)
+        method_signature = _build_method_signature(page_class_name=class_name, action=action, method_name=method_name)
+        if method_name == desired_method_name:
+            method_body = desired_method_body
+        else:
+            method_body = _build_method_snippet(
+                page_class_name=class_name,
+                action=action,
+                method_name=method_name,
+                locator_constant=locator_constant,
+                table_locator_constant=table_locator_constant,
+                log_language=normalized_log_language,
+                action_parameters=parameters,
+            )
         patched = _insert_region_entry(
             updated_source,
             "AUTO_ACTIONS",
@@ -735,6 +759,12 @@ def _contains_method(source: str, method_name: str) -> bool:
     return re.search(rf"\b{re.escape(method_name)}\s*\(", source) is not None
 
 
+def _contains_method_signature(source: str, signature: str) -> bool:
+    normalized_source = re.sub(r"\s+", "", source)
+    normalized_signature = re.sub(r"\s+", "", signature)
+    return f"{normalized_signature}{{" in normalized_source
+
+
 def _find_existing_locator_constant(source: str, by_expression: str) -> str | None:
     target = _normalize_expression(by_expression)
     locator_pattern = re.compile(
@@ -844,7 +874,6 @@ def _normalize_action_key(action: str) -> str | None:
     normalized = action.strip()
     alias_map = {
         "click": "clickElement",
-        "sendKeys": "javaScriptClearAndSetValue",
     }
     mapped = alias_map.get(normalized, normalized)
     if mapped in SUPPORTED_ACTIONS:
@@ -870,6 +899,8 @@ def _method_base_name(action: str, locator_name: str) -> str:
         return f"click{pascal_name}"
     if action == "javaScriptClicker":
         return f"jsClick{pascal_name}"
+    if action == "sendKeys":
+        return f"set{pascal_name}"
     if action == "scrollToElement":
         return f"scrollTo{pascal_name}"
     if action == "getText":
@@ -926,6 +957,8 @@ def _method_base_name(action: str, locator_name: str) -> str:
 def _build_method_signature(page_class_name: str, action: str, method_name: str) -> str:
     if action in {"clickElement", "javaScriptClicker", "scrollToElement"}:
         return f"public {page_class_name} {method_name}()"
+    if action == "sendKeys":
+        return f"public {page_class_name} {method_name}(String value)"
     if action == "javaScriptClearAndSetValue":
         return f"public {page_class_name} {method_name}(String value)"
     if action == "getText":
@@ -1066,6 +1099,32 @@ def _build_method_snippet(
             f"{signature} {{\n"
             f"    scrollToElement({locator_constant});\n"
             f"    logPass(\"{log_message}\");\n"
+            "    return this;\n"
+            "}"
+        )
+
+    if action == "sendKeys":
+        description = (
+            f"{label} alanına değer yazılır."
+            if log_language == "TR"
+            else f"Types value into {label} element."
+        )
+        param_line = " * @param value yazılacak değer" if log_language == "TR" else " * @param value value to type"
+        log_message = (
+            f"{label_java} alanına değer yazıldı: "
+            if log_language == "TR"
+            else f"Typed value into {label_java}: "
+        )
+        return (
+            "/**\n"
+            f" * {description}\n"
+            " *\n"
+            f"{param_line}\n"
+            " * @return this\n"
+            " */\n"
+            f"{signature} {{\n"
+            f"    sendKeys({locator_constant}, value);\n"
+            f"    logPass(\"{log_message}\" + value);\n"
             "    return this;\n"
             "}"
         )

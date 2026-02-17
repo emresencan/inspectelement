@@ -545,6 +545,9 @@ class WorkspaceWindow(QMainWindow):
         self.action_filter_group = QButtonGroup(self)
         self.action_filter_group.setExclusive(True)
         self.action_filter_buttons: dict[str, QPushButton] = {}
+        self.action_preset_group = QButtonGroup(self)
+        self.action_preset_group.setExclusive(True)
+        self.action_preset_buttons: dict[str, QPushButton] = {}
         self.selected_action_flow: FlowLayout | None = None
         self.available_action_specs = []
         self._action_search_timer = QTimer(self)
@@ -1650,6 +1653,11 @@ class WorkspaceWindow(QMainWindow):
             QPushButton#PresetChip:hover {
                 background: #eef2ff;
             }
+            QPushButton#PresetChip:checked {
+                background: #0ea5e9;
+                color: #ffffff;
+                border-color: #0284c7;
+            }
             QPlainTextEdit#GeneratedPreview {
                 font-family: "Menlo", "Consolas", monospace;
                 font-size: 12px;
@@ -1745,7 +1753,10 @@ class WorkspaceWindow(QMainWindow):
         for preset_name in ("Common UI", "Read", "JS", "Table Common", "ComboBox", "Clear"):
             preset_button = QPushButton(preset_name)
             preset_button.setObjectName("PresetChip")
-            preset_button.clicked.connect(lambda _checked=False, value=preset_name: self._apply_action_preset(value))
+            preset_button.setCheckable(True)
+            preset_button.clicked.connect(lambda _checked=False, value=preset_name: self._on_preset_clicked(value))
+            self.action_preset_group.addButton(preset_button)
+            self.action_preset_buttons[preset_name] = preset_button
             preset_row.addWidget(preset_button)
         preset_row.addStretch(1)
         root_layout.addLayout(preset_row)
@@ -1950,6 +1961,19 @@ class WorkspaceWindow(QMainWindow):
         if not preset_actions:
             return
         self._set_selected_actions(list(preset_actions))
+
+    def _on_preset_clicked(self, preset_name: str) -> None:
+        self._apply_action_preset(preset_name)
+        if preset_name == "Clear":
+            for button in self.action_preset_buttons.values():
+                button.blockSignals(True)
+                button.setChecked(False)
+                button.blockSignals(False)
+            return
+        for name, button in self.action_preset_buttons.items():
+            button.blockSignals(True)
+            button.setChecked(name == preset_name)
+            button.blockSignals(False)
 
     def _refresh_table_root_section(self) -> None:
         needs_table = has_table_actions(self.selected_actions)
@@ -2470,7 +2494,11 @@ class WorkspaceWindow(QMainWindow):
             if not preview.ok:
                 self._set_status(preview.message)
                 self.payload_status_label.setText(preview.message)
-                self._show_toast(preview.message)
+                lowered = preview.message.lower()
+                if "already exists" in lowered or "no changes generated" in lowered:
+                    self._show_toast(preview.message, duration_ms=4200)
+                else:
+                    self._show_toast(preview.message)
                 self._update_add_button_state()
                 return
 

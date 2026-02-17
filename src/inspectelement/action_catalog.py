@@ -53,6 +53,13 @@ ACTION_CATALOG: tuple[ActionSpec, ...] = (
         return_kind="fluent",
     ),
     ActionSpec(
+        key="sendKeys",
+        label="sendKeys",
+        category="Click",
+        description="Types value with BaseLibrary sendKeys.",
+        return_kind="fluent",
+    ),
+    ActionSpec(
         key="getText",
         label="getText",
         category="Read",
@@ -262,7 +269,7 @@ ACTION_CATALOG: tuple[ActionSpec, ...] = (
 CATEGORY_FILTERS: tuple[str, ...] = ("All", "Click", "Read", "State", "Scroll", "JS", "Table", "ComboBox")
 
 ACTION_PRESETS: dict[str, tuple[str, ...]] = {
-    "Common UI": ("clickElement", "isElementDisplayed", "scrollToElement"),
+    "Common UI": ("clickElement", "sendKeys", "isElementDisplayed", "scrollToElement"),
     "Read": ("getText", "getAttribute", "javaScriptGetValue"),
     "JS": ("javaScriptClicker", "javaScriptClearAndSetValue", "javaScriptGetInnerText"),
     "Table Common": (
