@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .locator_generator import normalize_classes
@@ -23,6 +24,14 @@ EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT = r"""
     }
     const pieces = text.split("'");
     return "concat(" + pieces.map((piece) => `'${piece}'`).join(", \"'\", ") + ")";
+  }
+
+  function normalizeText(value, limit = 200) {
+    const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) {
+      return '';
+    }
+    return normalized.slice(0, limit);
   }
 
   function countCss(selector) {
@@ -212,7 +221,7 @@ EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT = r"""
       );
     }
 
-    return list.slice(0, 12);
+    return list.slice(0, 6);
   }
 
   function buildSummary(el) {
@@ -245,10 +254,11 @@ EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT = r"""
     }
 
     const classes = Array.from(el.classList || []).filter(Boolean);
-    const textSnippet = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    const valueText = normalizeText(el.value || '', 200);
+    const textSnippet = normalizeText(el.innerText || el.textContent || '', 200) || valueText;
     const labels = el.labels ? Array.from(el.labels) : [];
-    const labelText = labels.length ? (labels[0].innerText || labels[0].textContent || '').replace(/\s+/g, ' ').trim() : '';
-    const outerHtml = (el.outerHTML || '').replace(/\s+/g, ' ').trim().slice(0, 320);
+    const labelText = labels.length ? normalizeText(labels[0].innerText || labels[0].textContent || '', 200) : '';
+    const outerHtml = normalizeText(el.outerHTML || '', 320);
 
     return {
       tag: (el.tagName || '').toLowerCase(),
@@ -263,6 +273,84 @@ EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT = r"""
       outer_html: outerHtml,
       attributes: attrs,
       ancestry,
+    };
+  }
+
+  function capturePayloadForPoint(rawX, rawY, fromDevicePixels) {
+    const dpr = Number(window.devicePixelRatio || 1) || 1;
+    const visualScale = Number(window.visualViewport && window.visualViewport.scale ? window.visualViewport.scale : 1) || 1;
+    let viewportX = Number(rawX);
+    let viewportY = Number(rawY);
+    if (!Number.isFinite(viewportX) || !Number.isFinite(viewportY)) {
+      return {
+        ok: false,
+        error: 'INVALID_COORDINATES',
+        warning: 'Inspect click coordinates are invalid.',
+      };
+    }
+
+    if (fromDevicePixels) {
+      viewportX = viewportX / dpr;
+      viewportY = viewportY / dpr;
+      if (visualScale > 0 && visualScale !== 1) {
+        viewportX = viewportX / visualScale;
+        viewportY = viewportY / visualScale;
+      }
+    }
+
+    const maxX = Math.max(0, (window.innerWidth || 1) - 1);
+    const maxY = Math.max(0, (window.innerHeight || 1) - 1);
+    viewportX = Math.min(Math.max(0, viewportX), maxX);
+    viewportY = Math.min(Math.max(0, viewportY), maxY);
+
+    const element = document.elementFromPoint(viewportX, viewportY);
+    if (!element) {
+      return {
+        ok: false,
+        error: 'ELEMENT_NOT_FOUND',
+        warning: 'Inspect could not resolve an element at this point.',
+        click: {
+          x: Number(rawX),
+          y: Number(rawY),
+          viewportX,
+          viewportY,
+          dpr,
+          visualScale,
+        },
+      };
+    }
+
+    const tag = (element.tagName || '').toLowerCase();
+    if (tag === 'iframe') {
+      return {
+        ok: false,
+        error: 'IFRAME_UNAVAILABLE',
+        warning: 'Cross-origin iframe content cannot be inspected from embedded mode.',
+        click: {
+          x: Number(rawX),
+          y: Number(rawY),
+          viewportX,
+          viewportY,
+          dpr,
+          visualScale,
+        },
+      };
+    }
+
+    const summary = buildSummary(element);
+    const candidates = buildCandidates(element, summary);
+    return {
+      ok: true,
+      summary,
+      candidates,
+      click: {
+        x: Number(rawX),
+        y: Number(rawY),
+        viewportX,
+        viewportY,
+        dpr,
+        visualScale,
+      },
     };
   }
 
@@ -355,16 +443,15 @@ EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT = r"""
         event.stopPropagation();
         event.stopImmediatePropagation();
 
-        const el = event.target;
-        const summary = buildSummary(el);
-        const candidates = buildCandidates(el, summary);
-        const payload = {
-          summary,
-          candidates,
-        };
-
-        if (window.__inspectBridge && window.__inspectBridge.report) {
-          window.__inspectBridge.report(payload);
+        const payload = capturePayloadForPoint(event.clientX, event.clientY, false);
+        if (window.__inspectBridge && window.__inspectBridge.report && payload && payload.ok) {
+          window.__inspectBridge.report({
+            summary: payload.summary,
+            candidates: payload.candidates,
+            click: payload.click,
+          });
+        } else if (window.__inspectBridge && window.__inspectBridge.log && payload && payload.warning) {
+          window.__inspectBridge.log(`Embedded inspect warning: ${payload.warning}`);
         }
         return false;
       };
@@ -403,6 +490,10 @@ EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT = r"""
         detachListeners();
       }
       return state.enabled;
+    };
+
+    window.__inspectelementCaptureFromPoint = (x, y, fromDevicePixels = true) => {
+      return capturePayloadForPoint(x, y, !!fromDevicePixels);
     };
 
     window.__inspectelementEmbeddedInstalled = true;
@@ -505,7 +596,7 @@ def build_element_summary_from_payload(summary_payload: dict[str, Any]) -> Eleme
 def build_locator_candidates_from_payload(
     candidate_payload: list[dict[str, Any]],
     learning_weights: dict[str, float] | None = None,
-    limit: int = 5,
+    limit: int = 6,
 ) -> list[LocatorCandidate]:
     drafts: list[LocatorCandidate] = []
     seen: set[tuple[str, str]] = set()
@@ -551,6 +642,144 @@ def build_locator_candidates_from_payload(
     return scored[: max(1, limit)]
 
 
+def build_capture_from_point_script(x: int, y: int) -> str:
+    return (
+        "(() => {"
+        "  if (!window.__inspectelementCaptureFromPoint) {"
+        "    return {ok:false,error:'INSPECTOR_NOT_READY',warning:'Inspector is not ready on this page.'};"
+        "  }"
+        f"  return window.__inspectelementCaptureFromPoint({int(x)}, {int(y)}, true);"
+        "})();"
+    )
+
+
+def build_fallback_locator_payload(summary_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    tag = str(summary_payload.get("tag") or "div").strip().lower() or "div"
+    raw_attrs = summary_payload.get("attributes")
+    attributes = {str(k): str(v) for k, v in (raw_attrs.items() if isinstance(raw_attrs, dict) else []) if v is not None}
+    classes = normalize_classes(summary_payload.get("classes") or [])
+    text = _normalize_space(str(summary_payload.get("text") or attributes.get("value") or ""))[:120]
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(
+        locator_type: str,
+        locator: str,
+        rule: str,
+        uniqueness_count: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        key = (locator_type, locator)
+        if not locator or key in seen:
+            return
+        seen.add(key)
+        rows.append(
+            {
+                "locator_type": locator_type,
+                "locator": locator,
+                "rule": rule,
+                "uniqueness_count": uniqueness_count,
+                "metadata": dict(metadata or {}),
+            }
+        )
+
+    element_id = str(summary_payload.get("id") or attributes.get("id") or "").strip()
+    if element_id:
+        css_id = f"#{_escape_css_identifier(element_id)}"
+        add("CSS", css_id, "stable_attr:id", 1)
+        add("XPath", f"//*[@id={_xpath_literal(element_id)}]", "stable_attr:id", 1)
+        add(
+            "Selenium",
+            f'By.id("{_escape_java_string(element_id)}")',
+            "stable_attr:id",
+            1,
+            {"selector_kind": "id", "selector_value": element_id},
+        )
+
+    stable_attrs = ("data-testid", "data-test", "data-qa", "name", "aria-label", "placeholder", "role", "title", "href", "type")
+    for attr in stable_attrs:
+        value = str(attributes.get(attr) or "").strip()
+        if not value:
+            continue
+        css = f'{tag}[{attr}="{_escape_css_string(value)}"]'
+        xpath = f"//*[@{attr}={_xpath_literal(value)}]"
+        add("CSS", css, f"stable_attr:{attr}", 1)
+        add("XPath", xpath, f"stable_attr:{attr}", 1)
+        add(
+            "Selenium",
+            f'By.cssSelector("{_escape_java_string(css)}")',
+            f"stable_attr:{attr}",
+            1,
+            {"selector_kind": "css", "selector_value": css},
+        )
+        if attr == "name":
+            add(
+                "Selenium",
+                f'By.name("{_escape_java_string(value)}")',
+                "stable_attr:name",
+                1,
+                {"selector_kind": "name", "selector_value": value},
+            )
+        if attr == "data-testid":
+            add(
+                "Playwright",
+                f'page.get_by_test_id("{_escape_java_string(value)}")',
+                "stable_attr:data-testid",
+                1,
+                {"playwright_kind": "test_id", "value": value},
+            )
+
+    meaningful_classes = [name for name in classes if not _looks_dynamic_class(name)]
+    if meaningful_classes:
+        class_tokens = meaningful_classes[:2]
+        css = f"{tag}{''.join(f'.{_escape_css_identifier(token)}' for token in class_tokens)}"
+        dynamic_count = max(0, len(classes) - len(meaningful_classes))
+        add("CSS", css, "meaningful_class", 2, {"dynamic_class_count": dynamic_count})
+        add(
+            "Selenium",
+            f'By.cssSelector("{_escape_java_string(css)}")',
+            "meaningful_class",
+            2,
+            {"selector_kind": "css", "selector_value": css, "dynamic_class_count": dynamic_count},
+        )
+
+    if text:
+        text_literal = _xpath_literal(text)
+        add("XPath", f"//{tag}[text()={text_literal}]", "xpath_text", 2)
+        add("XPath", f"//{tag}[normalize-space(.)={text_literal}]", "xpath_text", 2)
+        generic = f"//*[self::button or self::a or self::span][normalize-space(.)={text_literal}]"
+        add("XPath", f"({generic})[1]", "xpath_text", 2)
+        add("XPath", f"(//*[self::button or self::span or self::a][normalize-space(text())={text_literal}])[2]", "xpath_text", 2)
+        if tag in {"div", "span", "label"}:
+            add(
+                "XPath",
+                f"//{tag}[normalize-space(.)={text_literal}]/following-sibling::div[contains(@class,'list-item-value')]",
+                "xpath_text",
+                1,
+            )
+
+    raw_ancestry = summary_payload.get("ancestry")
+    ancestry = [item for item in raw_ancestry if isinstance(item, dict)] if isinstance(raw_ancestry, list) else []
+    in_ant_modal = any("ant-modal" in str(item.get("class") or "") for item in ancestry)
+    if in_ant_modal:
+        add(
+            "XPath",
+            "//div[contains(@class,'ant-modal') and not(contains(@style,'display:none'))]//label[contains(@class,'ant-radio-wrapper')]",
+            "ancestor",
+            1,
+        )
+        if text:
+            add(
+                "XPath",
+                f"(//div[contains(@class,'ant-modal')][not(@aria-hidden='true')]//button[.//span[normalize-space(.)={_xpath_literal(text)}] and not(contains(@class,'is-hidden'))])[1]",
+                "xpath_text",
+                1,
+            )
+
+    return rows
+
+
 def _as_optional_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -558,3 +787,50 @@ def _as_optional_text(value: Any) -> str | None:
     if not text:
         return None
     return text
+
+
+def _normalize_space(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _xpath_literal(value: str) -> str:
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    parts = value.split("'")
+    quoted = [f"'{part}'" for part in parts]
+    return "concat(" + ", \"'\", ".join(quoted) + ")"
+
+
+def _escape_css_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _escape_java_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _escape_css_identifier(value: str) -> str:
+    chunks: list[str] = []
+    for char in value:
+        if char.isalnum() or char in {"-", "_"}:
+            chunks.append(char)
+        else:
+            chunks.append(f"\\{ord(char):x} ")
+    return "".join(chunks)
+
+
+def _looks_dynamic_class(value: str) -> bool:
+    token = value.strip()
+    if not token:
+        return True
+    patterns = (
+        r"^css-[a-z0-9_-]{4,}$",
+        r"^jss\d+$",
+        r"^sc-[a-z0-9]+$",
+        r"^[a-f0-9]{8,}$",
+        r"^[a-z]+__[a-z]+___[a-z0-9]{5,}$",
+        r"^_?[a-z]{1,3}[0-9a-f]{6,}$",
+    )
+    return any(re.match(pattern, token, flags=re.IGNORECASE) for pattern in patterns)

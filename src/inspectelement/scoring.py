@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import re
 from typing import Iterable
 
 from .models import LocatorCandidate, ScoreBreakdown
@@ -27,6 +28,9 @@ BASE_RULE_SCORES: dict[str, float] = {
     "meaningful_class": 54.0,
     "text_role": 52.0,
     "xpath_text": 40.0,
+    "xpath_text_exact": 44.0,
+    "xpath_modal": 48.0,
+    "xpath_sibling": 46.0,
     # 6) Last resort
     "nth_fallback": 10.0,
 }
@@ -65,6 +69,8 @@ def score_candidate(
         dynamic_penalty += 10.0 + 2.0 * float(
             candidate.metadata.get("dynamic_class_count", 0)
         )
+    if _looks_dynamic_class_locator(candidate.locator):
+        dynamic_penalty += 16.0
     depth = candidate.locator.count(">") if candidate.locator_type == "CSS" else 0
     nth_count = candidate.locator.count("nth-of-type(")
     depth_penalty = float(depth * 12)
@@ -75,6 +81,13 @@ def score_candidate(
     learning_adjustment += float(
         learning_weights.get(candidate.rule.split(":", 1)[0], 0.0)
     )
+
+    if candidate.locator_type == "XPath" and candidate.rule.startswith("xpath_text"):
+        # Unique visible text is often stable enough for UI automation.
+        if candidate.uniqueness_count == 1:
+            stability += 16.0
+        elif candidate.uniqueness_count == 2:
+            stability += 8.0
 
     total = (
         uniqueness + stability - length_penalty - dynamic_penalty + learning_adjustment
@@ -105,3 +118,14 @@ def score_candidates(
     scored = [score_candidate(candidate, weights) for candidate in candidates]
     scored.sort(key=lambda item: item.score, reverse=True)
     return scored
+
+
+def _looks_dynamic_class_locator(locator: str) -> bool:
+    lowered = locator.lower()
+    patterns = (
+        r"\.[a-f0-9]{8,}",
+        r"\.css-[a-z0-9_-]{4,}",
+        r"\.jss\d+",
+        r"\.sc-[a-z0-9]+",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)

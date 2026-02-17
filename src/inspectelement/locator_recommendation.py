@@ -47,6 +47,9 @@ def score_locator_for_write(candidate: LocatorCandidate) -> tuple[float, tuple[s
         if _looks_dynamic_id(locator):
             score -= 35
             reasons.append("penalty:dynamic-id")
+    if candidate.locator_type == "Selenium" and "by.id(" in lowered:
+        score += 12
+        reasons.append("selenium:by-id-priority")
 
     if any(token in lowered for token in ("[name=", "@name", "aria-label", "placeholder")):
         score += 28

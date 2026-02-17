@@ -42,3 +42,14 @@ def test_recommendation_penalizes_dynamic_id_vs_name_selector() -> None:
 
     assert ordered[0].locator == 'input[name="email"]'
     assert ordered[1].metadata["write_recommendation_label"] in {"Risky", ""}
+
+
+def test_recommendation_prefers_selenium_by_id_when_id_exists() -> None:
+    candidates = [
+        _candidate("CSS", "#loginButton", rule="stable_attr:id", uniqueness_count=1),
+        _candidate("XPath", "//*[@id='loginButton']", rule="stable_attr:id", uniqueness_count=1),
+        _candidate("Selenium", 'By.id("loginButton")', rule="stable_attr:id", uniqueness_count=1),
+    ]
+
+    ordered = recommend_locator_candidates(candidates)
+    assert ordered[0].locator == 'By.id("loginButton")'

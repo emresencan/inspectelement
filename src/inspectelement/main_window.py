@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QPoint, QRect, QSize, QSettings, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QColor, QGuiApplication, QIcon
+from PySide6.QtGui import QCloseEvent, QGuiApplication, QIcon
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWidgets import (
     QApplication,
@@ -58,8 +58,11 @@ from .action_catalog import (
 from .embedded_inspector import (
     EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT,
     build_element_summary_from_payload,
+    build_fallback_locator_payload,
+    build_capture_from_point_script,
     build_locator_candidates_from_payload,
 )
+from .capture_guard import CaptureGuard
 from .java_pom_writer import (
     JavaPreview,
     apply_java_preview,
@@ -330,7 +333,25 @@ class BrowserPanel(QFrame):
         try:
             from PySide6.QtWebEngineWidgets import QWebEngineView  # type: ignore
 
-            self._web_view = QWebEngineView(self)
+            class InspectableWebView(QWebEngineView):
+                inspect_click = Signal(int, int)
+
+                def __init__(self, parent: QWidget | None = None) -> None:
+                    super().__init__(parent)
+                    self._inspect_capture_enabled = False
+
+                def set_inspect_capture_enabled(self, enabled: bool) -> None:
+                    self._inspect_capture_enabled = bool(enabled)
+
+                def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt API)
+                    if self._inspect_capture_enabled and event.button() == Qt.MouseButton.LeftButton:
+                        point = event.position()
+                        self.inspect_click.emit(int(point.x()), int(point.y()))
+                        event.accept()
+                        return
+                    super().mousePressEvent(event)
+
+            self._web_view = InspectableWebView(self)
             self._web_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self._web_view.setUrl(QUrl("about:blank"))
             root.addWidget(self._web_view, 1)
@@ -349,6 +370,14 @@ class BrowserPanel(QFrame):
     @property
     def has_web_view(self) -> bool:
         return self._web_view is not None
+
+    def set_inspect_capture_enabled(self, enabled: bool) -> None:
+        view = self._web_view
+        if view is None:
+            return
+        setter = getattr(view, "set_inspect_capture_enabled", None)
+        if callable(setter):
+            setter(bool(enabled))
 
     @property
     def current_title(self) -> str:
@@ -437,6 +466,10 @@ class WorkspaceWindow(QMainWindow):
         self._loading_workspace_state = False
         self._pending_inspect_restore = False
         self._has_launched_page = False
+        self._capture_busy = False
+        self._capture_guard = CaptureGuard()
+        self._capture_seq = 0
+        self._capture_active_seq = 0
         self._settings = QSettings("inspectelement", "workspace")
         self.learning_store = LearningStore()
 
@@ -1119,6 +1152,9 @@ class WorkspaceWindow(QMainWindow):
         self._embedded_bridge.log_received.connect(self._on_embedded_js_log)
         self._embedded_channel.registerObject("inspectBridge", self._embedded_bridge)
         web_view.page().setWebChannel(self._embedded_channel)
+        inspect_click_signal = getattr(web_view, "inspect_click", None)
+        if inspect_click_signal is not None:
+            inspect_click_signal.connect(self._on_embedded_view_click)
 
         web_view.loadFinished.connect(self._on_webview_load_finished)
         web_view.titleChanged.connect(self._on_webview_title_changed)
@@ -1130,6 +1166,8 @@ class WorkspaceWindow(QMainWindow):
             has_embedded_browser=self.browser_panel.has_web_view,
         )
         self.inspect_toggle.setEnabled(enabled)
+        if not enabled:
+            self.browser_panel.set_inspect_capture_enabled(False)
 
     def _run_webview_js(self, script: str, callback=None) -> None:
         web_view = self.browser_panel.web_view
@@ -1150,6 +1188,7 @@ class WorkspaceWindow(QMainWindow):
             f"window.__inspectelementDesiredEnabled = {bool_literal};"
             f"if (window.__inspectelementSetEnabled) window.__inspectelementSetEnabled({bool_literal});"
         )
+        self.browser_panel.set_inspect_capture_enabled(enabled)
         self._run_webview_js(script)
 
     def _on_embedded_js_log(self, message: str) -> None:
@@ -1157,6 +1196,89 @@ class WorkspaceWindow(QMainWindow):
         if not clean:
             return
         self.logger.info(clean)
+
+    def _on_embedded_view_click(self, x: int, y: int) -> None:
+        if not self.inspect_toggle.isChecked():
+            return
+        if self._capture_busy:
+            self.logger.info("Capture skipped because busy.")
+            return
+        if not self._capture_guard.begin():
+            self.logger.info("Capture skipped because busy.")
+            return
+
+        self._capture_busy = True
+        self._capture_seq += 1
+        capture_seq = self._capture_seq
+        self._capture_active_seq = capture_seq
+        self.logger.info("Embedded click received (%s, %s)", x, y)
+        self.logger.info("Capture started.")
+        script = build_capture_from_point_script(x, y)
+        QTimer.singleShot(5000, lambda seq=capture_seq: self._release_stuck_capture(seq))
+
+        try:
+            self._run_webview_js(script, callback=lambda result: self._on_embedded_capture_result(result, x, y, capture_seq))
+        except Exception:
+            self.logger.exception("Embedded capture execution failed.")
+            self._capture_busy = False
+            self._capture_active_seq = 0
+            self._capture_guard.finish()
+            self._set_status("Inspect capture could not run.")
+
+    def _release_stuck_capture(self, capture_seq: int) -> None:
+        if not self._capture_busy:
+            return
+        if capture_seq != self._capture_active_seq:
+            return
+        self.logger.info("Capture ended by timeout fallback.")
+        self._capture_busy = False
+        self._capture_active_seq = 0
+        self._capture_guard.finish()
+
+    def _on_embedded_capture_result(self, result: object, x: int, y: int, capture_seq: int) -> None:
+        if capture_seq != self._capture_active_seq:
+            return
+
+        def _process() -> None:
+            if not isinstance(result, dict):
+                self._set_status("Inspect payload was invalid.")
+                return
+
+            ok = bool(result.get("ok", False))
+            click_info = result.get("click")
+            if isinstance(click_info, dict):
+                view_x = click_info.get("viewportX")
+                view_y = click_info.get("viewportY")
+                self.logger.info(
+                    "Embedded click payload received (%s, %s) mapped=(%s, %s)",
+                    x,
+                    y,
+                    view_x,
+                    view_y,
+                )
+            else:
+                self.logger.info("Embedded click payload received (%s, %s)", x, y)
+
+            if not ok:
+                warning = str(result.get("warning") or result.get("error") or "Inspect capture failed.")
+                self._set_status(warning)
+                return
+
+            payload = {
+                "summary": result.get("summary"),
+                "candidates": result.get("candidates"),
+            }
+            self._on_embedded_capture_payload(payload)
+
+        try:
+            self._capture_guard.run_and_finish(_process)
+        except Exception:
+            self.logger.exception("Embedded capture processing failed.")
+            self._set_status("Embedded capture processing failed.")
+        finally:
+            self._capture_busy = False
+            self._capture_active_seq = 0
+            self.logger.info("Capture ended.")
 
     def _on_embedded_capture_payload(self, payload: object) -> None:
         self.logger.info("Embedded inspect click payload received.")
@@ -1173,7 +1295,13 @@ class WorkspaceWindow(QMainWindow):
         try:
             summary = build_element_summary_from_payload(summary_payload)
             learning_weights = self.learning_store.get_rule_weights()
-            candidates = build_locator_candidates_from_payload(candidates_payload, learning_weights=learning_weights, limit=5)
+            enriched_payload = list(candidates_payload)
+            enriched_payload.extend(build_fallback_locator_payload(summary_payload))
+            candidates = build_locator_candidates_from_payload(
+                enriched_payload,
+                learning_weights=learning_weights,
+                limit=6,
+            )
 
             page_context = self._build_page_context_from_browser_panel()
             self.current_page_context = page_context
@@ -1185,7 +1313,7 @@ class WorkspaceWindow(QMainWindow):
                         uniqueness_count=1,
                         learning_weights=learning_weights,
                     )
-                    candidates = inject_override_candidate(candidates, override_candidate, limit=5)
+                    candidates = inject_override_candidate(candidates, override_candidate, limit=6)
 
             self._on_capture(summary, candidates)
         except Exception as exc:
@@ -1215,10 +1343,9 @@ class WorkspaceWindow(QMainWindow):
         self._refresh_inspect_toggle_state()
         self._set_status("Embedded browser loaded.")
 
-        if self._pending_inspect_restore:
-            desired = bool(self.inspect_toggle.isChecked())
-            self._set_embedded_inspect_mode(desired)
-            self._pending_inspect_restore = False
+        desired = bool(self.inspect_toggle.isChecked()) or bool(self._pending_inspect_restore)
+        self._set_embedded_inspect_mode(desired)
+        self._pending_inspect_restore = False
 
     def _on_webview_title_changed(self, title: str) -> None:
         self.browser_panel.set_page_info(title or "", self.browser_panel.current_url)
@@ -1354,19 +1481,22 @@ class WorkspaceWindow(QMainWindow):
             }
             QTableWidget {
                 gridline-color: #94a3b8;
-                selection-background-color: #dbeafe;
+                selection-background-color: #eaf2ff;
                 selection-color: #0f172a;
             }
+            QTableWidget::item:hover {
+                background: transparent;
+            }
             QTableWidget::item:selected {
-                background: #dbeafe;
+                background: #eaf2ff;
                 color: #0f172a;
             }
             QTableWidget::item:selected:active {
-                background: #bfdbfe;
+                background: #eaf2ff;
                 color: #0f172a;
             }
             QTableWidget::item:selected:!active {
-                background: #dbeafe;
+                background: #eaf2ff;
                 color: #0f172a;
             }
             QWidget#LocatorCell {
@@ -1467,6 +1597,24 @@ class WorkspaceWindow(QMainWindow):
             QLabel#TableRootWarning {
                 color: #b91c1c;
                 font-weight: 600;
+            }
+            QLabel#GuidanceBadge {
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 1px 6px;
+                color: #334155;
+                background: #f8fafc;
+                font-size: 11px;
+            }
+            QLabel#GuidanceBadge[kind="recommended"] {
+                border-color: #86efac;
+                color: #166534;
+                background: #f0fdf4;
+            }
+            QLabel#GuidanceBadge[kind="risky"] {
+                border-color: #fecaca;
+                color: #991b1b;
+                background: #fef2f2;
             }
             """
         )
@@ -2449,6 +2597,9 @@ class WorkspaceWindow(QMainWindow):
             return
         self.url_input.setText(normalized)
         self._has_launched_page = False
+        self._capture_busy = False
+        self._capture_active_seq = 0
+        self._capture_guard.finish()
         desired_after_load = bool(self.inspect_toggle.isChecked()) or bool(self._pending_inspect_restore)
         self._pending_inspect_restore = desired_after_load
         self.inspect_toggle.blockSignals(True)
@@ -2467,6 +2618,10 @@ class WorkspaceWindow(QMainWindow):
         if not self.inspect_toggle.isEnabled():
             self._set_status("Launch a page first.")
             return
+        if not enabled:
+            self._capture_busy = False
+            self._capture_active_seq = 0
+            self._capture_guard.finish()
         self._ensure_embedded_inspector_script()
         self._set_embedded_inspect_mode(enabled)
         self._persist_workspace_state()
@@ -2704,21 +2859,30 @@ class WorkspaceWindow(QMainWindow):
             score_value = float(recommendation_score) if isinstance(recommendation_score, (int, float)) else candidate.score
             score_item = QTableWidgetItem(f"{score_value:.1f}")
             guidance_text = str(candidate.metadata.get("write_recommendation_label", "")).strip() or "-"
-            guidance_item = QTableWidgetItem(guidance_text)
             rank_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             score_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            guidance_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             self.results_table.setItem(row, 0, rank_item)
             self.results_table.setItem(row, 1, type_item)
             self.results_table.setItem(row, 3, score_item)
-            self.results_table.setItem(row, 4, guidance_item)
-
+            guidance_host = QWidget()
+            guidance_layout = QHBoxLayout(guidance_host)
+            guidance_layout.setContentsMargins(4, 2, 4, 2)
+            guidance_layout.setSpacing(0)
+            guidance_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            guidance_badge = QLabel(guidance_text if guidance_text != "-" else "")
+            guidance_badge.setObjectName("GuidanceBadge")
             if guidance_text == "Recommended":
-                guidance_item.setForeground(QColor("#166534"))
+                guidance_badge.setProperty("kind", "recommended")
             elif guidance_text == "Risky":
-                guidance_item.setForeground(QColor("#b91c1c"))
+                guidance_badge.setProperty("kind", "risky")
+            else:
+                guidance_badge.setProperty("kind", "neutral")
+            guidance_badge.style().unpolish(guidance_badge)
+            guidance_badge.style().polish(guidance_badge)
+            guidance_layout.addWidget(guidance_badge)
+            self.results_table.setCellWidget(row, 4, guidance_host)
 
             locator_cell = QWidget()
             locator_cell.setObjectName("LocatorCell")
