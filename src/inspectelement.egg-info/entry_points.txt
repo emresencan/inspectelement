@@ -1,2 +1,0 @@
-[console_scripts]
-inspectelement = inspectelement.__main__:main

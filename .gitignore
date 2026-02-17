@@ -24,3 +24,11 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Runtime / local generated files
+*.bak
+*.tmp
+*.log
+
+# Sprint notes (local planning docs)
+SPRINT_*.md
