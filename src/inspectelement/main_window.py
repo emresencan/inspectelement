@@ -1261,6 +1261,7 @@ class WorkspaceWindow(QMainWindow):
 
             if not ok:
                 warning = str(result.get("warning") or result.get("error") or "Inspect capture failed.")
+                self.logger.info("Capture warning: %s", warning)
                 self._set_status(warning)
                 return
 

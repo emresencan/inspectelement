@@ -504,8 +504,9 @@ EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT = r"""
   }
 
   function ensureBridgeAndInstall() {
+    installInspector();
+
     if (window.__inspectBridge) {
-      installInspector();
       return;
     }
 
@@ -531,9 +532,13 @@ EMBEDDED_INSPECTOR_BOOTSTRAP_SCRIPT = r"""
       return;
     }
 
+    if (window.__inspectelementQWebChannelReady) {
+      return;
+    }
+    window.__inspectelementQWebChannelReady = true;
+
     new QWebChannel(qt.webChannelTransport, (channel) => {
       window.__inspectBridge = channel.objects.inspectBridge;
-      installInspector();
     });
   }
 
@@ -648,7 +653,14 @@ def build_capture_from_point_script(x: int, y: int) -> str:
         "  if (!window.__inspectelementCaptureFromPoint) {"
         "    return {ok:false,error:'INSPECTOR_NOT_READY',warning:'Inspector is not ready on this page.'};"
         "  }"
-        f"  return window.__inspectelementCaptureFromPoint({int(x)}, {int(y)}, true);"
+        f"  const _x = {int(x)};"
+        f"  const _y = {int(y)};"
+        "  const first = window.__inspectelementCaptureFromPoint(_x, _y, false);"
+        "  if (first && first.ok) { return first; }"
+        "  const second = window.__inspectelementCaptureFromPoint(_x, _y, true);"
+        "  if (second && second.ok) { return second; }"
+        "  if (first && first.warning) { return first; }"
+        "  return second || first || {ok:false,error:'CAPTURE_FAILED',warning:'Inspect capture failed.'};"
         "})();"
     )
 
