@@ -29,13 +29,13 @@ def test_promote_clickable_ancestor_prefers_anchor_stable_locator() -> None:
             "attrs": {"data-testid": "scheduleBoxHotel"},
         }
     )
-    page = FakePage({'a[data-testid="scheduleBoxHotel"]': 1})
+    page = FakePage({'[data-testid="scheduleBoxHotel"]': 1})
 
     drafts = _build_promoted_clickable_ancestor_drafts(page, element)
 
     assert drafts is not None
     css_locators = [draft.locator for draft in drafts if draft.locator_type == "CSS"]
-    assert css_locators == ['a[data-testid="scheduleBoxHotel"]']
+    assert css_locators == ['[data-testid="scheduleBoxHotel"]']
     assert all(" div" not in locator for locator in css_locators)
 
 
@@ -86,8 +86,8 @@ def test_promote_child_inside_button_to_button_id() -> None:
     drafts = _build_promoted_clickable_ancestor_drafts(page, element)
 
     assert drafts is not None
-    css_locators = [draft.locator for draft in drafts if draft.locator_type == "CSS"]
-    assert css_locators == ["#bookNowBtn"]
+    selenium_locators = [draft.locator for draft in drafts if draft.locator_type == "Selenium"]
+    assert selenium_locators == ['By.id("bookNowBtn")']
 
 
 def test_do_not_promote_blocklisted_root_id() -> None:

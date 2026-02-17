@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 LocatorType = Literal["CSS", "XPath", "Playwright", "Selenium"]
+ConfidenceLevel = Literal["HIGH", "MEDIUM", "LOW"]
 
 
 @dataclass(slots=True)
@@ -22,15 +23,50 @@ class ElementSummary:
     ancestry: list[dict[str, str]] = field(default_factory=list)
     table_root: dict[str, str] | None = None
     table_roots: list[dict[str, str]] = field(default_factory=list)
+    title: str | None = None
+    value_text: str | None = None
+    aria_labelledby_text: str | None = None
 
     def signature(self) -> str:
-        keys = ("id", "name", "data-testid", "data-test", "data-qa", "aria-label", "type")
+        keys = (
+            "id",
+            "name",
+            "data-testid",
+            "data-test",
+            "data-qa",
+            "data-cy",
+            "aria-label",
+            "type",
+        )
         pieces = [f"tag={self.tag}"]
         for key in keys:
             value = self.attributes.get(key)
             if value:
                 pieces.append(f"{key}={value}")
         return "|".join(pieces)
+
+
+@dataclass(slots=True)
+class LocatorStrategy:
+    strategy_type: str
+    locator_type: LocatorType
+    value: str
+    rule: str
+    strategy_key: str
+    confidence: ConfidenceLevel = "LOW"
+    uniqueness_count: int = 0
+    stable: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class DomSnapshot:
+    node_count: int
+    text_node_count: int
+    title: str
+    url: str
+    tag_histogram: dict[str, int] = field(default_factory=dict)
+    attribute_histogram: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -52,6 +88,8 @@ class LocatorCandidate:
     score: float = 0.0
     breakdown: ScoreBreakdown | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    confidence: ConfidenceLevel = "LOW"
+    strategy_type: str = ""
 
 
 @dataclass(slots=True)

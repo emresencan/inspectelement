@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from .models import LocatorCandidate
+from .selector_rules import is_absolute_xpath, is_forbidden_locator, is_index_based_xpath
 
 
 def recommend_locator_candidates(candidates: list[LocatorCandidate]) -> list[LocatorCandidate]:
@@ -34,87 +35,84 @@ def score_locator_for_write(candidate: LocatorCandidate) -> tuple[float, tuple[s
     locator = candidate.locator or ""
     lowered = locator.lower()
 
-    score = 50.0
+    base_score = float(candidate.score) if candidate.score else 50.0
+    score = base_score
     reasons: list[str] = []
 
-    if any(attr in lowered for attr in ("data-testid", "data-test", "data-qa")):
-        score += 55
-        reasons.append("stable:test-attribute")
+    strategy = str(candidate.metadata.get("strategy_type") or candidate.strategy_type or "").strip().lower()
+    confidence = str(candidate.metadata.get("confidence") or candidate.confidence or "LOW").strip().upper()
 
-    if _contains_id_pattern(lowered):
-        score += 35
-        reasons.append("stable:id")
-        if _looks_dynamic_id(locator):
-            score -= 35
-            reasons.append("penalty:dynamic-id")
-    if candidate.locator_type == "Selenium" and "by.id(" in lowered:
-        score += 12
-        reasons.append("selenium:by-id-priority")
+    if strategy == "id":
+        score += 10
+        reasons.append("strategy:id")
+    elif strategy == "data_attr":
+        score += 8
+        reasons.append("strategy:data-attr")
+    elif strategy == "name":
+        score += 7
+        reasons.append("strategy:name")
+    elif strategy == "accessibility":
+        score += 5
+        reasons.append("strategy:a11y")
+    elif strategy == "text_xpath":
+        score += 3
+        reasons.append("strategy:text-xpath")
 
-    if any(token in lowered for token in ("[name=", "@name", "aria-label", "placeholder")):
-        score += 28
-        reasons.append("stable:name-aria-placeholder")
-
-    if candidate.locator_type == "CSS" and "[" in locator and "]" in locator:
-        score += 12
-        reasons.append("css:attribute")
-
-    if candidate.locator_type == "XPath":
-        score -= 8
-        reasons.append("xpath:base-penalty")
-        if "normalize-space" in lowered or "text()" in lowered:
-            score += 8
-            reasons.append("xpath:text")
-
-    if _is_absolute_xpath(lowered):
-        score -= 60
-        reasons.append("penalty:absolute-xpath")
-
-    if _is_index_based(lowered):
-        score -= 45
-        reasons.append("penalty:index")
-
-    if "nth-of-type" in lowered:
-        score -= 35
-        reasons.append("penalty:nth")
-
-    if len(locator) > 120:
-        score -= 20
-        reasons.append("penalty:length>120")
-    if len(locator) > 200:
-        score -= 20
-        reasons.append("penalty:length>200")
-
-    if candidate.locator_type == "Playwright":
-        if "get_by_test_id" in lowered:
-            score += 50
-            reasons.append("playwright:testid")
-        elif "get_by_label" in lowered or "get_by_placeholder" in lowered:
-            score += 28
-            reasons.append("playwright:label-placeholder")
+    if confidence == "HIGH":
+        score += 10
+        reasons.append("confidence:high")
+    elif confidence == "MEDIUM":
+        score += 4
+        reasons.append("confidence:medium")
 
     if candidate.uniqueness_count == 1:
-        score += 12
+        score += 10
         reasons.append("uniqueness:1")
     elif candidate.uniqueness_count > 1:
-        score -= min(25, (candidate.uniqueness_count - 1) * 6)
+        score -= min(35, (candidate.uniqueness_count - 1) * 8)
         reasons.append("penalty:not-unique")
+    else:
+        score -= 20
+        reasons.append("penalty:no-match")
+
+    if is_forbidden_locator(locator, candidate.locator_type):
+        score -= 45
+        reasons.append("penalty:forbidden-pattern")
+
+    if candidate.locator_type == "XPath":
+        if is_absolute_xpath(locator):
+            score -= 55
+            reasons.append("penalty:absolute-xpath")
+        if is_index_based_xpath(locator):
+            score -= 38
+            reasons.append("penalty:index")
+        if "normalize-space" in lowered:
+            score += 5
+            reasons.append("xpath:normalize-space")
+
+    if candidate.locator_type == "Selenium" and "by.id(" in lowered:
+        score += 6
+        reasons.append("selenium:by-id")
+
+    if candidate.metadata.get("prefix_salvaged"):
+        score -= 10
+        reasons.append("penalty:prefix-salvage")
+    if candidate.metadata.get("dynamic_detected"):
+        score -= 8
+        reasons.append("penalty:dynamic-attribute")
+
+    if _looks_dynamic_id(locator):
+        score -= 22
+        reasons.append("penalty:dynamic-id")
 
     bounded = max(0.0, min(100.0, score))
-    risky = bounded < 35 or _is_absolute_xpath(lowered) or _is_index_based(lowered) or "nth-of-type" in lowered
+    risky = (
+        bounded < 35
+        or candidate.uniqueness_count != 1
+        or is_forbidden_locator(locator, candidate.locator_type)
+        or (candidate.locator_type == "XPath" and (is_absolute_xpath(locator) or is_index_based_xpath(locator)))
+    )
     return bounded, tuple(reasons), risky
-
-
-def _contains_id_pattern(lowered_locator: str) -> bool:
-    return "#" in lowered_locator or "[id=" in lowered_locator or "@id" in lowered_locator or "by.id" in lowered_locator
-
-
-def _is_absolute_xpath(lowered_locator: str) -> bool:
-    return lowered_locator.startswith("/html") or lowered_locator.startswith("/body")
-
-
-def _is_index_based(lowered_locator: str) -> bool:
-    return bool(re.search(r"\[\d+\]", lowered_locator))
 
 
 def _looks_dynamic_id(locator: str) -> bool:
@@ -125,6 +123,8 @@ def _looks_dynamic_id(locator: str) -> bool:
         if not cleaned:
             continue
         if re.search(r"[A-Za-z]{1,4}\d{4,}$", cleaned):
+            return True
+        if re.search(r"[_:-]\d{4,}$", cleaned):
             return True
         if re.fullmatch(r"[0-9]+", cleaned):
             return True
