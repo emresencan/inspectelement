@@ -89,8 +89,8 @@ def compute_workspace_button_state(
     has_name: bool,
     has_pending_preview: bool,
 ) -> WorkspaceButtonState:
-    can_preview = has_page and has_locator and has_name and not has_pending_preview
-    can_validate = has_page and has_locator and has_name and not has_pending_preview
+    can_preview = has_page and has_locator and has_name
+    can_validate = has_page and has_locator and has_name
     can_apply = has_pending_preview
     can_cancel_preview = has_pending_preview
 

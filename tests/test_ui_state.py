@@ -56,8 +56,8 @@ def test_compute_workspace_button_state_with_pending_preview() -> None:
         has_pending_preview=True,
     )
 
-    assert state.can_preview is False
-    assert state.can_validate is False
+    assert state.can_preview is True
+    assert state.can_validate is True
     assert state.can_apply is True
     assert state.can_cancel_preview is True
 

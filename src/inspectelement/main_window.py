@@ -65,7 +65,7 @@ from .embedded_inspector import (
 from .capture_guard import CaptureGuard
 from .java_pom_writer import (
     JavaPreview,
-    apply_java_preview,
+    apply_java_previews,
     generate_java_preview,
 )
 from .learning_store import LearningStore
@@ -460,7 +460,7 @@ class WorkspaceWindow(QMainWindow):
         self.project_root: Path | None = None
         self.selected_module: ModuleInfo | None = None
         self.discovered_pages: list[PageClassInfo] = []
-        self.pending_java_preview: JavaPreview | None = None
+        self.pending_java_previews: list[JavaPreview] = []
         self.pending_page_preview: PageCreationPreview | None = None
         self._available_modules: list[ModuleInfo] = []
         self._loading_workspace_state = False
@@ -830,6 +830,15 @@ class WorkspaceWindow(QMainWindow):
         self.diff_preview_dock.setObjectName("Card")
         self.diff_preview_dock.setVisible(False)
 
+        self.diff_queue_label = QLabel("Queued changes: 0")
+        self.diff_queue_label.setObjectName("Muted")
+        self.diff_preview_selector = QComboBox()
+        self.diff_preview_selector.currentIndexChanged.connect(self._on_pending_preview_selected)
+        self.diff_preview_selector.setEnabled(False)
+        self.diff_remove_selected_button = QPushButton("Remove Selected")
+        self.diff_remove_selected_button.setEnabled(False)
+        self.diff_remove_selected_button.clicked.connect(self._remove_selected_pending_preview)
+
         self.diff_target_label = QLabel("Target file: -")
         self.diff_target_label.setObjectName("Muted")
         self.diff_locator_label = QLabel("Final locator: -")
@@ -853,6 +862,13 @@ class WorkspaceWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(QLabel("Preview Diff Dock"))
+        queue_row = QHBoxLayout()
+        queue_row.setContentsMargins(0, 0, 0, 0)
+        queue_row.setSpacing(6)
+        queue_row.addWidget(self.diff_queue_label)
+        queue_row.addWidget(self.diff_preview_selector, 1)
+        queue_row.addWidget(self.diff_remove_selected_button)
+        layout.addLayout(queue_row)
         layout.addWidget(self.diff_target_label)
         layout.addWidget(self.diff_locator_label)
         layout.addWidget(self.diff_methods_label)
@@ -870,7 +886,55 @@ class WorkspaceWindow(QMainWindow):
         self.diff_preview_text.setPlainText(preview.diff_text)
         self.diff_preview_dock.setVisible(True)
 
+    def _refresh_pending_previews_dock(self, *, selected_index: int | None = None) -> None:
+        previews = self.pending_java_previews
+        count = len(previews)
+        self.diff_queue_label.setText(f"Queued changes: {count}")
+        self.diff_preview_selector.blockSignals(True)
+        self.diff_preview_selector.clear()
+        for index, preview in enumerate(previews, start=1):
+            methods_text = ", ".join(preview.added_methods) if preview.added_methods else "change"
+            label = f"{index}. {preview.target_file.name} -> {methods_text}"
+            self.diff_preview_selector.addItem(label)
+        self.diff_preview_selector.blockSignals(False)
+
+        has_items = count > 0
+        self.diff_preview_selector.setEnabled(has_items)
+        self.diff_remove_selected_button.setEnabled(has_items)
+
+        if not has_items:
+            self._clear_java_preview_dock()
+            return
+
+        if selected_index is None or selected_index < 0 or selected_index >= count:
+            selected_index = count - 1
+        self.diff_preview_selector.setCurrentIndex(selected_index)
+        self._render_java_preview_dock(previews[selected_index])
+
+    def _on_pending_preview_selected(self, index: int) -> None:
+        if index < 0 or index >= len(self.pending_java_previews):
+            return
+        self._render_java_preview_dock(self.pending_java_previews[index])
+
+    def _remove_selected_pending_preview(self) -> None:
+        index = self.diff_preview_selector.currentIndex()
+        if index < 0 or index >= len(self.pending_java_previews):
+            return
+        removed = self.pending_java_previews.pop(index)
+        removed_methods = ", ".join(removed.added_methods) if removed.added_methods else removed.target_file.name
+        self._set_status(f"Removed queued preview: {removed_methods}")
+        self._reset_generated_preview_override()
+        self._refresh_pending_previews_dock(selected_index=min(index, len(self.pending_java_previews) - 1))
+        self._update_generated_methods_preview()
+        self._update_add_button_state()
+
     def _clear_java_preview_dock(self) -> None:
+        self.diff_queue_label.setText("Queued changes: 0")
+        self.diff_preview_selector.blockSignals(True)
+        self.diff_preview_selector.clear()
+        self.diff_preview_selector.blockSignals(False)
+        self.diff_preview_selector.setEnabled(False)
+        self.diff_remove_selected_button.setEnabled(False)
         self.diff_target_label.setText("Target file: -")
         self.diff_locator_label.setText("Final locator: -")
         self.diff_methods_label.setText("Methods: -")
@@ -2024,7 +2088,6 @@ class WorkspaceWindow(QMainWindow):
             self.manual_table_root_warning = "Warning: unstable table root locator (xpath)."
         else:
             self.manual_table_root_warning = None
-        self._cancel_pending_preview(clear_status=False)
         self._refresh_table_root_section()
 
     def _clear_manual_table_root(self) -> None:
@@ -2033,7 +2096,6 @@ class WorkspaceWindow(QMainWindow):
         self.manual_table_root_locator_name = None
         self.manual_table_root_warning = None
         self.pick_table_root_mode = False
-        self._cancel_pending_preview(clear_status=False)
         self._set_status("Manual table root override cleared.")
         self._refresh_table_root_section()
         self._update_generated_methods_preview()
@@ -2058,7 +2120,6 @@ class WorkspaceWindow(QMainWindow):
             self.auto_table_root_selector_value = None
             self.auto_table_root_locator_name = None
             self.auto_table_root_warning = None
-        self._cancel_pending_preview(clear_status=False)
         self._refresh_table_root_section()
 
     def _start_table_root_pick_mode(self) -> None:
@@ -2073,7 +2134,6 @@ class WorkspaceWindow(QMainWindow):
 
     def _on_element_name_changed(self, _value: str) -> None:
         self._reset_generated_preview_override()
-        self._cancel_pending_preview(clear_status=False)
         self._update_add_button_state()
 
     def _update_generated_methods_preview(self) -> None:
@@ -2363,7 +2423,7 @@ class WorkspaceWindow(QMainWindow):
             has_page=has_page,
             has_locator=has_locator,
             has_name=has_name,
-            has_pending_preview=self.pending_java_preview is not None,
+            has_pending_preview=bool(self.pending_java_previews),
         )
         self.add_button.setEnabled(button_state.can_preview)
         self.validate_button.setEnabled(button_state.can_validate)
@@ -2372,14 +2432,17 @@ class WorkspaceWindow(QMainWindow):
         if not (has_page and has_locator and has_name):
             self.payload_status_label.setText("Waiting for page, locator, and element name.")
         else:
-            if self.pending_java_preview is None:
+            if self.pending_java_previews:
+                self.payload_status_label.setText(
+                    f"{len(self.pending_java_previews)} preview(s) queued. Continue adding or Apply."
+                )
+            else:
                 self._refresh_payload_status("Payload ready. Click Add -> Preview.")
 
     def _selected_actions(self) -> list[str]:
         return list(self.selected_actions)
 
     def _on_action_selection_changed(self) -> None:
-        self._cancel_pending_preview(clear_status=False)
         self._refresh_table_root_section()
         self._refresh_parameter_panel()
         self._update_generated_methods_preview()
@@ -2405,41 +2468,39 @@ class WorkspaceWindow(QMainWindow):
         try:
             preview = self._generate_preview_for_current_request()
             if not preview.ok:
-                self.pending_java_preview = None
-                self._clear_java_preview_dock()
                 self._set_status(preview.message)
                 self.payload_status_label.setText(preview.message)
                 self._show_toast(preview.message)
                 self._update_add_button_state()
                 return
 
-            self.pending_java_preview = preview
-            self._set_status(preview.message)
-            self.payload_status_label.setText(preview.message)
+            self.pending_java_previews.append(preview)
+            queue_count = len(self.pending_java_previews)
+            self._set_status(f"Preview queued ({queue_count}). {preview.message}")
+            self.payload_status_label.setText(f"Queued preview {queue_count}.")
             self.preview_locator_name_override = preview.final_locator_name
             self.preview_signatures_override = list(preview.added_method_signatures)
             self.preview_signatures_actions_snapshot = tuple(self._selected_actions())
-            self._render_java_preview_dock(preview)
+            self._refresh_pending_previews_dock(selected_index=queue_count - 1)
             self._update_generated_methods_preview()
             self._update_add_button_state()
             self._persist_workspace_state()
             return
         except Exception as exc:
-            self.pending_java_preview = None
-            self._clear_java_preview_dock()
             self._handle_ui_exception("Unexpected error during preview/apply. See ~/.inspectelement/ui.log.", exc)
 
     def _apply_pending_preview(self) -> None:
-        preview = self.pending_java_preview
-        if preview is None:
+        previews = list(self.pending_java_previews)
+        if not previews:
             self._set_status("No pending preview to apply.")
             return
 
         try:
-            applied, message, _backup_path = apply_java_preview(preview)
-            self.pending_java_preview = None
-            self._clear_java_preview_dock()
-            self._reset_generated_preview_override()
+            applied, message, _backup_paths = apply_java_previews(previews)
+            if applied:
+                self.pending_java_previews = []
+                self._clear_java_preview_dock()
+                self._reset_generated_preview_override()
             self._set_status(message)
             self.payload_status_label.setText(message)
             self._show_toast(message)
@@ -2449,13 +2510,11 @@ class WorkspaceWindow(QMainWindow):
             if not applied:
                 return
         except Exception as exc:
-            self.pending_java_preview = None
-            self._clear_java_preview_dock()
             self._handle_ui_exception("Unexpected error during apply. See ~/.inspectelement/ui.log.", exc)
 
     def _cancel_pending_preview(self, clear_status: bool = True) -> None:
-        had_preview = self.pending_java_preview is not None
-        self.pending_java_preview = None
+        had_preview = bool(self.pending_java_previews)
+        self.pending_java_previews = []
         self._clear_java_preview_dock()
         self._reset_generated_preview_override()
         if had_preview and clear_status:
@@ -2517,6 +2576,7 @@ class WorkspaceWindow(QMainWindow):
 
         selector_type, selector_value = selector_details
         selected_table_root = self._selected_table_root_selector()
+        source_override = self._latest_staged_source_for_target(page.file_path)
         return generate_java_preview(
             target_file=page.file_path,
             locator_name=self.element_name_input.text().strip(),
@@ -2528,7 +2588,17 @@ class WorkspaceWindow(QMainWindow):
             table_root_selector_type=selected_table_root[0] if selected_table_root else None,
             table_root_selector_value=selected_table_root[1] if selected_table_root else None,
             table_root_locator_name=self._selected_table_root_locator_name() if selected_table_root else None,
+            source_override=source_override,
         )
+
+    def _latest_staged_source_for_target(self, target_file: Path) -> str | None:
+        for preview in reversed(self.pending_java_previews):
+            if preview.target_file != target_file:
+                continue
+            if preview.updated_source is None:
+                continue
+            return preview.updated_source
+        return None
 
     def _validate_current_request(self) -> str | None:
         page = self._selected_page_class()
@@ -2748,7 +2818,6 @@ class WorkspaceWindow(QMainWindow):
         self._copy(edited)
 
     def _on_capture(self, summary: ElementSummary, candidates: list[LocatorCandidate]) -> None:
-        self._cancel_pending_preview(clear_status=False)
         self._reset_generated_preview_override()
         self.current_summary = summary
         self._set_auto_table_root_from_summary(summary)
@@ -2955,7 +3024,6 @@ class WorkspaceWindow(QMainWindow):
         if candidate:
             self._show_breakdown(candidate)
             self.locator_editor.setPlainText(candidate.locator)
-        self._cancel_pending_preview(clear_status=False)
         self._reset_generated_preview_override()
         self._refresh_parameter_panel()
         self._update_add_button_state()

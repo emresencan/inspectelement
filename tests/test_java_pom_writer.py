@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
 import re
 
 import pytest
 
 from inspectelement.java_pom_writer import (
     SAFE_PARSE_ERROR,
+    apply_java_previews,
     build_action_method_signature_preview,
+    generate_java_preview,
     prepare_java_patch,
 )
 
@@ -616,3 +619,85 @@ def test_style_alignment_preserves_crlf_line_endings() -> None:
     assert result.changed
     assert "\r\n" in result.updated_source
     assert "\r\nprivate final By" not in result.updated_source  # keeps class indentation
+
+
+def test_generate_java_preview_uses_source_override_for_staged_changes(tmp_path: Path) -> None:
+    target_file = tmp_path / "FolderPage.java"
+    target_file.write_text(
+        """public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+""",
+        encoding="utf-8",
+    )
+
+    first = generate_java_preview(
+        target_file=target_file,
+        locator_name="HOME_BTN",
+        selector_type="xpath",
+        selector_value="//button[normalize-space()='Home']",
+        actions=("clickElement",),
+    )
+    assert first.ok
+    assert first.updated_source is not None
+
+    second = generate_java_preview(
+        target_file=target_file,
+        locator_name="TITLE_TXT",
+        selector_type="xpath",
+        selector_value="//h1[normalize-space()='Title']",
+        actions=("getText",),
+        source_override=first.updated_source,
+    )
+    assert second.ok
+    assert second.updated_source is not None
+    assert "public FolderPage clickHomeBtn()" in second.updated_source
+    assert "public String getTitleTxtText()" in second.updated_source
+
+
+def test_apply_java_previews_applies_staged_queue_in_single_write(tmp_path: Path) -> None:
+    target_file = tmp_path / "FolderPage.java"
+    initial_source = """public class FolderPage extends BaseLibrary {
+    // region AUTO_LOCATORS
+    // endregion AUTO_LOCATORS
+
+    // region AUTO_ACTIONS
+    // endregion AUTO_ACTIONS
+}
+"""
+    target_file.write_text(initial_source, encoding="utf-8")
+
+    first = generate_java_preview(
+        target_file=target_file,
+        locator_name="HOME_BTN",
+        selector_type="xpath",
+        selector_value="//button[normalize-space()='Home']",
+        actions=("clickElement",),
+    )
+    assert first.ok
+    assert first.updated_source is not None
+
+    second = generate_java_preview(
+        target_file=target_file,
+        locator_name="TITLE_TXT",
+        selector_type="xpath",
+        selector_value="//h1[normalize-space()='Title']",
+        actions=("getText",),
+        source_override=first.updated_source,
+    )
+    assert second.ok
+
+    applied, message, backup_paths = apply_java_previews([first, second])
+    assert applied is True
+    assert "Applied 2 queued preview(s)" in message
+    assert len(backup_paths) == 1
+    assert backup_paths[0].name == "FolderPage.java.bak"
+    assert backup_paths[0].read_text(encoding="utf-8") == initial_source
+
+    final_source = target_file.read_text(encoding="utf-8")
+    assert "public FolderPage clickHomeBtn()" in final_source
+    assert "public String getTitleTxtText()" in final_source

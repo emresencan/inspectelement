@@ -346,22 +346,26 @@ def generate_java_preview(
     table_root_selector_type: str | None = None,
     table_root_selector_value: str | None = None,
     table_root_locator_name: str | None = None,
+    source_override: str | None = None,
 ) -> JavaPreview:
-    try:
-        original_source = target_file.read_text(encoding="utf-8")
-    except OSError as exc:
-        return JavaPreview(
-            ok=False,
-            target_file=target_file,
-            message=f"Could not read target file: {exc}",
-            diff_text="",
-            final_locator_name=None,
-            added_methods=(),
-            added_method_signatures=(),
-            original_source=None,
-            updated_source=None,
-            notes=(),
-        )
+    if source_override is None:
+        try:
+            original_source = target_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            return JavaPreview(
+                ok=False,
+                target_file=target_file,
+                message=f"Could not read target file: {exc}",
+                diff_text="",
+                final_locator_name=None,
+                added_methods=(),
+                added_method_signatures=(),
+                original_source=None,
+                updated_source=None,
+                notes=(),
+            )
+    else:
+        original_source = source_override
 
     patch = prepare_java_patch(
         source=original_source,
@@ -446,26 +450,112 @@ def apply_java_preview(preview: JavaPreview) -> tuple[bool, str, Path | None]:
         )
 
     backup_path = Path(f"{target_file}.bak")
+    ok, write_message = _write_with_backup_atomic(
+        target_file=target_file,
+        current_source=current_source,
+        updated_source=preview.updated_source,
+        backup_path=backup_path,
+    )
+    if not ok:
+        return False, write_message, None
+
+    return True, f"Applied. Backup created at {backup_path}", backup_path
+
+
+def apply_java_previews(previews: Sequence[JavaPreview]) -> tuple[bool, str, tuple[Path, ...]]:
+    valid_previews = [
+        preview
+        for preview in previews
+        if preview.ok and preview.updated_source is not None and preview.original_source is not None
+    ]
+    if not valid_previews:
+        return False, "No preview to apply.", ()
+
+    ordered_targets: list[Path] = []
+    base_sources: dict[Path, str] = {}
+    final_sources: dict[Path, str] = {}
+
+    for preview in valid_previews:
+        target = preview.target_file
+        original_source = preview.original_source
+        updated_source = preview.updated_source
+        if target not in base_sources:
+            ordered_targets.append(target)
+            base_sources[target] = original_source
+            final_sources[target] = updated_source
+            continue
+        if final_sources[target] != original_source:
+            return (
+                False,
+                f"Queued preview chain mismatch for {target}. Regenerate preview queue before apply.",
+                (),
+            )
+        final_sources[target] = updated_source
+
+    current_sources: dict[Path, str] = {}
+    for target in ordered_targets:
+        try:
+            current_source = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            return False, f"Could not read target file before apply: {exc}", ()
+        current_sources[target] = current_source
+        if current_source != base_sources[target]:
+            return (
+                False,
+                f"Target file changed after preview: {target}. Regenerate preview before apply.",
+                (),
+            )
+
+    backup_paths: list[Path] = []
+    for target in ordered_targets:
+        backup_path = Path(f"{target}.bak")
+        ok, write_message = _write_with_backup_atomic(
+            target_file=target,
+            current_source=current_sources[target],
+            updated_source=final_sources[target],
+            backup_path=backup_path,
+        )
+        if not ok:
+            return False, write_message, tuple(backup_paths)
+        backup_paths.append(backup_path)
+
+    files_count = len(ordered_targets)
+    previews_count = len(valid_previews)
+    backups_label = ", ".join(str(path) for path in backup_paths)
+    return (
+        True,
+        f"Applied {previews_count} queued preview(s) across {files_count} file(s). Backup created at {backups_label}",
+        tuple(backup_paths),
+    )
+
+
+def _write_with_backup_atomic(
+    *,
+    target_file: Path,
+    current_source: str,
+    updated_source: str,
+    backup_path: Path,
+) -> tuple[bool, str]:
     try:
         backup_path.write_text(current_source, encoding="utf-8")
     except OSError as exc:
-        return False, f"Could not create backup: {exc}", None
+        return False, f"Could not create backup: {exc}"
 
     temp_path: Path | None = None
     try:
         fd, temp_name = tempfile.mkstemp(prefix=f".{target_file.name}.", suffix=".tmp", dir=str(target_file.parent))
         temp_path = Path(temp_name)
         with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
-            temp_file.write(preview.updated_source)
+            temp_file.write(updated_source)
             temp_file.flush()
             os.fsync(temp_file.fileno())
         temp_path.replace(target_file)
     except OSError as exc:
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
-        return False, f"Could not write target file: {exc}", None
+        return False, f"Could not write target file: {exc}"
 
-    return True, f"Applied. Backup created at {backup_path}", backup_path
+    return True, "ok"
 
 
 def _find_primary_class_span(source: str) -> tuple[str, int, int] | None:
