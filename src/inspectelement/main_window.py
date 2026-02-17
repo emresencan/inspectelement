@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QPoint, QRect, QSize, QSettings, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QGuiApplication, QIcon
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication, QIcon
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWidgets import (
     QApplication,
@@ -197,6 +197,7 @@ class TopBar(QFrame):
         self.url_input = QLineEdit("https://example.com")
         self.url_input.setPlaceholderText("https://your-app-url")
         self.launch_button = QPushButton("Launch")
+        self.open_browser_button = QPushButton("Open Browser")
 
         self.inspect_toggle = QPushButton("Inspect: OFF")
         self.inspect_toggle.setCheckable(True)
@@ -219,6 +220,7 @@ class TopBar(QFrame):
             (self.project_browse_button, 90),
             (self.new_page_button, 110),
             (self.launch_button, 88),
+            (self.open_browser_button, 120),
             (self.inspect_toggle, 110),
             (self.validate_button, 120),
             (self.add_button, 130),
@@ -247,12 +249,13 @@ class TopBar(QFrame):
         layout.addWidget(QLabel("URL"), 1, 0)
         layout.addWidget(self.url_input, 1, 1, 1, 3)
         layout.addWidget(self.launch_button, 1, 4)
-        layout.addWidget(self.inspect_toggle, 1, 5)
-        layout.addWidget(self.validate_button, 1, 6)
-        layout.addWidget(self.add_button, 1, 7)
-        layout.addWidget(self.apply_button, 1, 8)
-        layout.addWidget(self.cancel_preview_button, 1, 9)
-        layout.addWidget(self.status_pill, 1, 10)
+        layout.addWidget(self.open_browser_button, 1, 5)
+        layout.addWidget(self.inspect_toggle, 1, 6)
+        layout.addWidget(self.validate_button, 1, 7)
+        layout.addWidget(self.add_button, 1, 8)
+        layout.addWidget(self.apply_button, 1, 9)
+        layout.addWidget(self.cancel_preview_button, 1, 10)
+        layout.addWidget(self.status_pill, 1, 11)
 
     def set_status_pill(self, level: str) -> None:
         normalized = level.lower()
@@ -484,6 +487,7 @@ class WorkspaceWindow(QMainWindow):
         self.new_page_button = self.top_bar.new_page_button
         self.url_input = self.top_bar.url_input
         self.launch_button = self.top_bar.launch_button
+        self.open_browser_button = self.top_bar.open_browser_button
         self.inspect_toggle = self.top_bar.inspect_toggle
         self.validate_button = self.top_bar.validate_button
         self.add_button = self.top_bar.add_button
@@ -498,6 +502,7 @@ class WorkspaceWindow(QMainWindow):
         self.new_page_button.clicked.connect(self._create_new_page_flow)
         self.url_input.editingFinished.connect(self._persist_workspace_state)
         self.launch_button.clicked.connect(self._launch)
+        self.open_browser_button.clicked.connect(self._open_external_browser)
         self.inspect_toggle.clicked.connect(self._toggle_inspect)
         self.validate_button.clicked.connect(self._validate_only_request)
         self.add_button.clicked.connect(self._prepare_add_request)
@@ -2708,6 +2713,19 @@ class WorkspaceWindow(QMainWindow):
         self._refresh_inspect_toggle_state()
         self.browser_panel.load_url(normalized)
         self._set_status(f"Launching: {normalized}")
+        self._persist_workspace_state()
+
+    def _open_external_browser(self) -> None:
+        normalized = self._normalize_url_for_workspace(self.url_input.text())
+        if not normalized:
+            self._set_status("Please enter a URL.")
+            return
+        self.url_input.setText(normalized)
+        opened = QDesktopServices.openUrl(QUrl(normalized))
+        if opened:
+            self._set_status(f"Opened in system browser: {normalized}")
+        else:
+            self._set_status("Could not open system browser.")
         self._persist_workspace_state()
 
     def _toggle_inspect(self) -> None:
