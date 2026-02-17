@@ -281,6 +281,12 @@ ACTION_PRESETS: dict[str, tuple[str, ...]] = {
 
 _ACTION_BY_KEY: dict[str, ActionSpec] = {spec.key: spec for spec in ACTION_CATALOG}
 _EXPLICIT_ADD_TRIGGERS: frozenset[str] = frozenset({"button_click", "checkbox_confirm", "combo_activated"})
+_STRICT_REQUIRED_PARAMETER_KEYS: dict[str, tuple[str, ...]] = {
+    "selectBySelectIdAuto": ("selectId",),
+    # Table methods are generated with runtime method params; only clickButtonInRow needs
+    # explicit inner locator expression at generation time.
+    "tableClickButtonInRow": ("innerLocator",),
+}
 
 
 def list_action_specs(include_advanced: bool = True) -> tuple[ActionSpec, ...]:
@@ -353,13 +359,22 @@ def has_combo_actions(selected_actions: Iterable[str]) -> bool:
     return any(get_action_spec(action_key) and get_action_spec(action_key).category == "ComboBox" for action_key in selected_actions)
 
 
-def required_parameter_keys(selected_actions: Iterable[str]) -> tuple[str, ...]:
+def action_parameter_keys(selected_actions: Iterable[str]) -> tuple[str, ...]:
     ordered: list[str] = []
     for action_key in normalize_selected_actions(selected_actions):
         spec = get_action_spec(action_key)
         if not spec:
             continue
         for key in spec.parameter_keys:
+            if key not in ordered:
+                ordered.append(key)
+    return tuple(ordered)
+
+
+def required_parameter_keys(selected_actions: Iterable[str]) -> tuple[str, ...]:
+    ordered: list[str] = []
+    for action_key in normalize_selected_actions(selected_actions):
+        for key in _STRICT_REQUIRED_PARAMETER_KEYS.get(action_key, ()):
             if key not in ordered:
                 ordered.append(key)
     return tuple(ordered)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import re
 from typing import Mapping, Sequence
 
-from .action_catalog import has_table_actions, required_parameter_keys
+from .action_catalog import action_parameter_keys, has_table_actions, required_parameter_keys
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +39,7 @@ def validate_generation_request(
             return GenerationValidation(False, f"{key} is required for selected action(s).")
 
     timeout_value = str(action_parameters.get("timeoutSec", "")).strip()
-    if "timeoutSec" in required_params:
+    if "timeoutSec" in set(action_parameter_keys(actions)):
         if not timeout_value.isdigit() or int(timeout_value) <= 0:
             return GenerationValidation(False, "timeoutSec must be a positive integer.")
 

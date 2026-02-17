@@ -52,11 +52,27 @@ def test_validate_blocks_invalid_timeout_and_inner_locator() -> None:
     assert not timeout_result.ok
     assert timeout_result.message == "timeoutSec must be a positive integer."
 
+    missing_locator_result = validate_generation_request(
+        has_page=True,
+        has_locator=True,
+        element_name="ROW_TXT",
+        actions=["tableClickButtonInRow"],
+        action_parameters={
+            "timeoutSec": "10",
+            "matchColumnHeader": "Durum",
+            "matchText": "Aktif",
+            "innerLocator": "",
+        },
+        has_table_root=True,
+    )
+    assert not missing_locator_result.ok
+    assert missing_locator_result.message == "innerLocator is required for selected action(s)."
+
     locator_result = validate_generation_request(
         has_page=True,
         has_locator=True,
         element_name="ROW_TXT",
-        actions=["tableClickInRow"],
+        actions=["tableClickButtonInRow"],
         action_parameters={
             "timeoutSec": "10",
             "matchColumnHeader": "Durum",

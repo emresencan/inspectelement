@@ -46,13 +46,13 @@ from .action_catalog import (
     CATEGORY_FILTERS,
     ActionSignaturePreview,
     add_action_by_trigger,
+    action_parameter_keys,
     action_label,
     build_signature_previews,
     filter_action_specs,
     has_combo_actions,
     has_table_actions,
     normalize_selected_actions,
-    required_parameter_keys,
     return_kind_badge,
 )
 from .embedded_inspector import (
@@ -1913,15 +1913,15 @@ class WorkspaceWindow(QMainWindow):
             self.table_root_warning_label.setVisible(True)
 
     def _refresh_parameter_panel(self) -> None:
-        required = set(required_parameter_keys(self.selected_actions))
-        self.parameter_panel.setVisible(bool(required))
+        visible_keys = set(action_parameter_keys(self.selected_actions))
+        self.parameter_panel.setVisible(bool(visible_keys))
         for key, widget in self.param_widgets.items():
-            widget.setVisible(key in required)
+            widget.setVisible(key in visible_keys)
             label = self.parameter_form_layout.labelForField(widget)
             if label:
-                label.setVisible(key in required)
+                label.setVisible(key in visible_keys)
 
-        if "selectId" in required:
+        if "selectId" in visible_keys:
             candidate = self._selected_candidate()
             resolved = self._resolve_java_selector(candidate) if candidate else None
             if resolved and resolved[0] == "id":

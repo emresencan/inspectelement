@@ -1,5 +1,6 @@
 from inspectelement.action_catalog import (
     ACTION_PRESETS,
+    action_parameter_keys,
     add_action_by_trigger,
     build_signature_previews,
     filter_action_specs,
@@ -48,12 +49,20 @@ def test_action_category_helpers_and_required_parameters() -> None:
     selected = ["tableAssertRowExists", "tableHasAnyRow", "selectBySelectIdAuto"]
     assert has_table_actions(selected)
     assert has_combo_actions(selected)
-    params = required_parameter_keys(selected)
-    assert "timeoutSec" in params
-    assert "matchType" in params
-    assert "columnHeader" in params
-    assert "expectedText" in params
-    assert "selectId" in params
+    visible_params = action_parameter_keys(selected)
+    assert "timeoutSec" in visible_params
+    assert "matchType" in visible_params
+    assert "columnHeader" in visible_params
+    assert "expectedText" in visible_params
+    required_params = required_parameter_keys(selected)
+    assert required_params == ("selectId",)
+
+
+def test_required_parameters_only_force_click_button_inner_locator() -> None:
+    non_button_table = required_parameter_keys(["tableSetInputInColumn"])
+    assert non_button_table == ()
+    click_button = required_parameter_keys(["tableClickButtonInRow"])
+    assert click_button == ("innerLocator",)
 
 
 def test_build_signature_previews_with_table_locator_name() -> None:
